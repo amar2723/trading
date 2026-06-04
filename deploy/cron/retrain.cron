@@ -1,0 +1,2 @@
+# Run scheduled retraining daily at 02:00 server time.
+0 2 * * * cd /opt/trading_ai && /usr/bin/docker compose --profile retrain run --rm retrainer >> logs/retraining.log 2>&1

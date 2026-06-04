@@ -1,0 +1,12 @@
+{
+  "symbol": "XAUUSD",
+  "primary_timeframe": "M5",
+  "timeframes": ["M1", "M5", "M15", "H1"],
+  "bars": 500,
+  "model_path": "models/xgboost_model.pkl",
+  "poll_seconds": 5,
+  "confidence_threshold": 70.0,
+  "max_spread": 80.0,
+  "max_atr": 25.0,
+  "daily_loss_limit": 300.0
+}

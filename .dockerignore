@@ -1,0 +1,16 @@
+.git
+.pytest_cache
+.pytest_tmp
+__pycache__
+*.pyc
+.venv
+venv
+data/raw/*.csv
+data/processed/*.csv
+data/patterns/*.csv
+data/labeled/*.csv
+models/*.pkl
+models/*.joblib
+reports/**
+logs/**
+.env

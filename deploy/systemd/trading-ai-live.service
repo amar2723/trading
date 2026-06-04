@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading AI Live Engine
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading_ai
+ExecStart=/usr/bin/docker compose --profile live up live
+ExecStop=/usr/bin/docker compose --profile live down
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

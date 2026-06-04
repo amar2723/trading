@@ -1,0 +1,74 @@
+services:
+  dashboard:
+    build: .
+    container_name: trading-ai-dashboard
+    env_file:
+      - .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./mlruns:/app/mlruns
+    command: streamlit run dashboard/app.py --server.address=0.0.0.0 --server.port=8501
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "ops/healthcheck.py", "--mode", "dashboard"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  live:
+    build: .
+    container_name: trading-ai-live
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./mlruns:/app/mlruns
+    command: python run_live.py
+    restart: unless-stopped
+    profiles: ["live"]
+    healthcheck:
+      test: ["CMD", "python", "ops/healthcheck.py", "--mode", "files"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mlflow:
+    build: .
+    container_name: trading-ai-mlflow
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./models:/app/models
+    command: mlflow server --backend-store-uri file:/app/mlruns --default-artifact-root /app/mlruns --host 0.0.0.0 --port 5000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "ops/healthcheck.py", "--mode", "mlflow"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  retrainer:
+    build: .
+    container_name: trading-ai-retrainer
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./mlruns:/app/mlruns
+    command: python ops/scheduled_retraining.py
+    restart: "no"
+    profiles: ["retrain"]

@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 30s
+
+scrape_configs:
+  - job_name: trading-ai
+    static_configs:
+      - targets: ["dashboard:8501", "mlflow:5000"]
