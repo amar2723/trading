@@ -4,6 +4,7 @@ import argparse
 import time
 
 from src.live_data import fetch_live_candles
+from src.adaptive_strategy import adaptive_rejection_reason, load_adaptive_strategy, strategy_detector_kwargs
 from src.market_filters import add_filter_features, passes_chop_filter, passes_session_filter, passes_trend_filter
 from mtf_live import run_mtf_prediction
 from src.outcome_tracker import record_signal_for_outcome, update_pending_outcomes
@@ -29,11 +30,12 @@ def scan_once(
     trend_alignment: bool = False,
     avoid_chop: bool = False,
     min_chop_ratio: float = 4.0,
+    adaptive_strategy: dict | None = None,
 ) -> tuple[dict, tuple[str, str] | None, str | None]:
     candles = fetch_live_candles(symbol, timeframe, bars)
     candles = add_filter_features(candles)
     update_pending_outcomes(candles)
-    detected = detect_pattern(candles)
+    detected = detect_pattern(candles, **strategy_detector_kwargs(adaptive_strategy or {}))
     signal = detected.to_dict()
     candle_time = signal["time"]
 
@@ -54,6 +56,10 @@ def scan_once(
             return signal, last_signal_key, candle_time
         if not passes_chop_filter(signal_row, avoid_chop, min_chop_ratio):
             print("Rejected by chop filter")
+            return signal, last_signal_key, candle_time
+        adaptive_reason = adaptive_rejection_reason(signal, signal_row, adaptive_strategy or {})
+        if adaptive_reason:
+            print(f"Rejected by adaptive strategy: {adaptive_reason}")
             return signal, last_signal_key, candle_time
 
         signal_key = (signal["time"], signal["signal"])
@@ -79,6 +85,8 @@ def main() -> None:
     parser.add_argument("--trend-alignment", action="store_true")
     parser.add_argument("--avoid-chop", action="store_true")
     parser.add_argument("--min-chop-ratio", type=float, default=4.0)
+    parser.add_argument("--adaptive", action="store_true", help="Use reports/outcome_strategy.json as an extra live filter")
+    parser.add_argument("--adaptive-path", default="reports/outcome_strategy.json")
     parser.add_argument("--mtf", action="store_true", help="Use H1/M15/M5 multi-timeframe engine")
     parser.add_argument("--once", action="store_true", help="Run one scan and exit")
     args = parser.parse_args()
@@ -86,6 +94,9 @@ def main() -> None:
     last_signal_key: tuple[str, str] | None = None
     last_candle_time: str | None = None
     print("Phase 1 live scanner started. No trading. Collecting signals only.")
+    adaptive_strategy = load_adaptive_strategy(args.adaptive_path) if args.adaptive else None
+    if args.adaptive:
+        print(f"Adaptive strategy loaded: {args.adaptive_path if adaptive_strategy else 'not found'}")
 
     if args.mtf:
         result = run_mtf_prediction(args.symbol)
@@ -101,6 +112,7 @@ def main() -> None:
             trend_alignment=args.trend_alignment,
             avoid_chop=args.avoid_chop,
             min_chop_ratio=args.min_chop_ratio,
+            adaptive_strategy=adaptive_strategy,
         )
         return
 
@@ -116,6 +128,7 @@ def main() -> None:
                 args.trend_alignment,
                 args.avoid_chop,
                 args.min_chop_ratio,
+                adaptive_strategy,
             )
         except Exception as exc:
             print(f"Scanner error: {exc}")
