@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XAUUSD Strategy Research</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #09111f;
+        --panel: #111827;
+        --muted: #9ca3af;
+        --text: #e5e7eb;
+        --green: #22c55e;
+        --red: #ef4444;
+        --line: #243145;
+      }
+      body {
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      main {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 28px 16px 48px;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        gap: 18px;
+        align-items: flex-end;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 18px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 30px;
+      }
+      h2 {
+        margin: 0 0 14px;
+        font-size: 18px;
+      }
+      p {
+        color: var(--muted);
+        line-height: 1.55;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin: 18px 0;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .metric-label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .metric-value {
+        font-size: 24px;
+        margin-top: 8px;
+        font-weight: 700;
+      }
+      .good {
+        color: var(--green);
+      }
+      .bad {
+        color: var(--red);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 8px;
+        text-align: left;
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 6px 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .warning {
+        border-color: #854d0e;
+        background: #422006;
+      }
+      .section {
+        margin-top: 18px;
+      }
+      @media (max-width: 760px) {
+        header {
+          display: block;
+        }
+        .grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>XAUUSD Strategy Research</h1>
+          <p>Vercel deployment of exported strategy/outcome data. Live MT5 execution remains on the Windows PC/VPS dashboard.</p>
+        </div>
+        <span class="badge" id="exported">Loading...</span>
+      </header>
+
+      <section class="grid" id="metrics"></section>
+
+      <section class="panel warning">
+        <h2>Live Data Note</h2>
+        <p>
+          This Vercel site is a public research report. It does not connect to MetaTrader 5.
+          For real-time candles, image upload trade plans, live bid/ask, SL and TP suggestions,
+          use the Streamlit app running on your Windows PC or Windows VPS with MT5 open.
+        </p>
+      </section>
+
+      <section class="section panel">
+        <h2>Recommended Rule</h2>
+        <div id="rule"></div>
+      </section>
+
+      <section class="section panel">
+        <h2>Direction Evidence</h2>
+        <table id="direction"></table>
+      </section>
+
+      <section class="section panel">
+        <h2>Best Time Windows</h2>
+        <table id="hours"></table>
+      </section>
+
+      <section class="section panel">
+        <h2>Session Evidence</h2>
+        <table id="sessions"></table>
+      </section>
+    </main>
+    <script>
+      const fmt = (n, d = 2) => Number.isFinite(Number(n)) ? Number(n).toFixed(d) : "-";
+      const pct = (n) => `${fmt(n)}%`;
+      const metric = (label, value, cls = "") => `<div class="panel"><div class="metric-label">${label}</div><div class="metric-value ${cls}">${value}</div></div>`;
+      const rows = (items, columns) => {
+        const head = `<tr>${columns.map(([key, label]) => `<th>${label}</th>`).join("")}</tr>`;
+        const body = items.map((item) => `<tr>${columns.map(([key]) => `<td>${formatCell(key, item[key])}</td>`).join("")}</tr>`).join("");
+        return head + body;
+      };
+      const formatCell = (key, value) => {
+        if (key.includes("win_rate")) return pct(value);
+        if (key.includes("profit_factor") || key.includes("expectancy") || key.includes("drawdown") || key === "score") return fmt(value, 3);
+        return value;
+      };
+
+      fetch("/data/outcome_strategy.json")
+        .then((res) => res.json())
+        .then((data) => {
+          document.getElementById("exported").textContent = `Exported ${data.exported_at}`;
+          const all = data.evidence.all;
+          document.getElementById("metrics").innerHTML = [
+            metric("Trades", all.trades),
+            metric("Profit Factor", fmt(all.profit_factor, 3), all.profit_factor >= 1 ? "good" : "bad"),
+            metric("Win Rate", pct(all.win_rate)),
+            metric("Expectancy", `${fmt(all.expectancy, 3)}R`, all.expectancy > 0 ? "good" : "bad"),
+            metric("Max Drawdown", `${fmt(all.max_drawdown, 2)}R`, "bad"),
+            metric("Allowed Direction", data.allowed_signals.join(", "), "good"),
+            metric("Best Session", data.session, "good"),
+            metric("Min Confidence", pct(data.min_confidence)),
+          ].join("");
+
+          document.getElementById("rule").innerHTML = `
+            <p><strong>Direction:</strong> ${data.allowed_signals.join(", ")}</p>
+            <p><strong>Hours:</strong> ${data.allowed_hours.map((h) => `${String(h).padStart(2, "0")}:00`).join(", ")}</p>
+            <p><strong>Pattern:</strong> score ${data.pattern.min_score}/4, body ${data.pattern.body_multiplier}x average, close-near ${data.pattern.close_near_ratio}, sweep required ${data.pattern.require_sweep}</p>
+            <p><strong>Risk filter:</strong> TP1 RR at least ${data.min_tp1_rr}, avoid chop ${data.avoid_chop}, chop ratio ${data.min_chop_ratio}</p>
+          `;
+
+          document.getElementById("direction").innerHTML = rows(data.evidence.by_signal, [
+            ["signal", "Signal"],
+            ["trades", "Trades"],
+            ["win_rate", "Win Rate"],
+            ["profit_factor", "PF"],
+            ["expectancy", "Expectancy"],
+            ["max_drawdown", "Drawdown"],
+          ]);
+          document.getElementById("hours").innerHTML = rows(data.evidence.by_hour, [
+            ["hour", "Hour"],
+            ["trades", "Trades"],
+            ["win_rate", "Win Rate"],
+            ["profit_factor", "PF"],
+            ["expectancy", "Expectancy"],
+            ["max_drawdown", "Drawdown"],
+          ]);
+          document.getElementById("sessions").innerHTML = rows(data.evidence.by_session, [
+            ["session", "Session"],
+            ["trades", "Trades"],
+            ["win_rate", "Win Rate"],
+            ["profit_factor", "PF"],
+            ["expectancy", "Expectancy"],
+            ["max_drawdown", "Drawdown"],
+          ]);
+        });
+    </script>
+  </body>
+</html>

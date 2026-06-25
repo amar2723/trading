@@ -1,0 +1,66 @@
+{
+  "exported_at": "2026-06-25",
+  "mode": "paper_research_only",
+  "warning": "No accuracy guarantee. Vercel shows exported research data only. Live MT5 data requires the Windows PC/VPS dashboard.",
+  "allowed_signals": ["SELL"],
+  "allowed_hours": [14, 15, 16, 17, 18, 19],
+  "session": "NEW_YORK",
+  "trend_alignment": false,
+  "avoid_chop": true,
+  "min_chop_ratio": 4.0,
+  "min_confidence": 75,
+  "min_tp1_rr": 1.5,
+  "pattern": {
+    "min_score": 4,
+    "body_multiplier": 1.5,
+    "close_near_ratio": 0.35,
+    "require_sweep": true
+  },
+  "evidence": {
+    "all": {
+      "trades": 146,
+      "win_rate": 36.986301369863014,
+      "profit_factor": 1.120253164556962,
+      "expectancy": 0.06506849315068493,
+      "max_drawdown": -16.5
+    },
+    "by_signal": [
+      {
+        "signal": "SELL",
+        "trades": 75,
+        "win_rate": 44.0,
+        "profit_factor": 1.4210526315789473,
+        "expectancy": 0.21333333333333335,
+        "max_drawdown": -16.0,
+        "score": 3.0721052631578947
+      },
+      {
+        "signal": "BUY",
+        "trades": 71,
+        "win_rate": 29.577464788732392,
+        "profit_factor": 0.8414634146341463,
+        "expectancy": -0.09154929577464789,
+        "max_drawdown": -10.0,
+        "score": 1.4140535898316728
+      }
+    ],
+    "by_hour": [
+      {"hour": 19, "trades": 6, "win_rate": 66.66666666666666, "profit_factor": 3.0, "expectancy": 0.6666666666666666, "max_drawdown": -1.0, "score": 8.626666666666667},
+      {"hour": 18, "trades": 5, "win_rate": 60.0, "profit_factor": 2.25, "expectancy": 0.5, "max_drawdown": -2.0, "score": 6.449999999999999},
+      {"hour": 15, "trades": 11, "win_rate": 45.45454545454545, "profit_factor": 1.5, "expectancy": 0.2727272727272727, "max_drawdown": -2.0, "score": 4.182727272727273},
+      {"hour": 16, "trades": 8, "win_rate": 50.0, "profit_factor": 1.5, "expectancy": 0.25, "max_drawdown": -2.0, "score": 4.13},
+      {"hour": 17, "trades": 8, "win_rate": 37.5, "profit_factor": 1.5, "expectancy": 0.3125, "max_drawdown": -4.0, "score": 3.9925},
+      {"hour": 14, "trades": 18, "win_rate": 44.44444444444444, "profit_factor": 1.5, "expectancy": 0.25, "max_drawdown": -4.0, "score": 3.9744444444444444}
+    ],
+    "by_session": [
+      {"session": "NEW_YORK", "trades": 27, "win_rate": 51.85185185185185, "profit_factor": 1.8461538461538463, "expectancy": 0.4074074074074074, "max_drawdown": -6.0, "score": 5.103048433048434},
+      {"session": "LONDON", "trades": 25, "win_rate": 40.0, "profit_factor": 1.25, "expectancy": 0.12, "max_drawdown": -6.5, "score": 2.86},
+      {"session": "OVERLAP", "trades": 37, "win_rate": 37.83783783783784, "profit_factor": 1.1428571428571428, "expectancy": 0.08108108108108109, "max_drawdown": -5.5, "score": 2.727335907335908},
+      {"session": "OTHER", "trades": 57, "win_rate": 28.07017543859649, "profit_factor": 0.7727272727272727, "expectancy": -0.13157894736842105, "max_drawdown": -13.5, "score": 0.6514194577352468}
+    ],
+    "by_trend": [
+      {"trend_direction": "BEARISH", "trades": 44, "win_rate": 38.63636363636363, "profit_factor": 1.108695652173913, "expectancy": 0.056818181818181816, "max_drawdown": -8.0, "score": 2.4142094861660075},
+      {"trend_direction": "BULLISH", "trades": 29, "win_rate": 31.03448275862069, "profit_factor": 1.03125, "expectancy": 0.017241379310344827, "max_drawdown": -12.0, "score": 1.5145689655172414}
+    ]
+  }
+}
