@@ -33,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger("RenderCloudTrader")
 
 # Import the production trader engine
-from scripts.autonomous_live_trader import ProductionRuntimeManager, STATE_FILE
+from scripts.autonomous_live_trader import ProductionRuntimeManager, STATE_FILE, run_24_7_service
 
 # Global runtime manager
 manager = None
@@ -122,7 +122,7 @@ def main():
     logger.info("Starting Autonomous Live Market Scanner (24/7 Loop)...")
     while True:
         try:
-            manager.run_loop()
+            run_24_7_service()
         except KeyboardInterrupt:
             logger.info("Service shutdown requested.")
             break
