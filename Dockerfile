@@ -19,6 +19,11 @@ COPY . .
 
 RUN mkdir -p data/raw data/processed data/patterns data/labeled models reports logs mlruns
 
-EXPOSE 8501
+ENV PORT=10000 \
+    TELEGRAM_BOT_TOKEN="9088596436:AAHOp0uhVtA4snr9ARmmncS_ljwnIkxyq68" \
+    TELEGRAM_CHAT_ID="6124128574" \
+    OCTA_REAL_ACCOUNT="125726194"
 
-CMD ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+EXPOSE 10000
+
+CMD ["python", "render_main.py"]
