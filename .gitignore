@@ -11,5 +11,6 @@ data/raw/*.csv
 data/processed/*.csv
 data/labels/*.csv
 models/*.pkl
+!models/xauusd_master_ensemble.pkl
 models/*.joblib
 .streamlit/secrets.toml

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: xauusd-24-7-trader
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python render_main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: TELEGRAM_BOT_TOKEN
+        value: 9088596436:AAHOp0uhVtA4snr9ARmmncS_ljwnIkxyq68
+      - key: TELEGRAM_CHAT_ID
+        value: "6124128574"
+      - key: OCTA_REAL_ACCOUNT
+        value: "125726194"
+      - key: TRADING_MODE
+        value: LIVE_ALERT
+      - key: XAUUSD_M5_WINDOW
+        value: "100"

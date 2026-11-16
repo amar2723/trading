@@ -23,8 +23,8 @@ def format_signal_message(symbol: str, signal: dict) -> str:
 
 
 def send_telegram_alert(symbol: str, signal: dict) -> bool:
-    token = os.getenv("BOT_TOKEN")
-    chat_id = os.getenv("CHAT_ID")
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
     if not token or not chat_id:
         return False
 
