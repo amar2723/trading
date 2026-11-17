@@ -42,6 +42,12 @@ from src.risk_governor import RiskGovernor
 from src.signal_journal import SignalJournal
 from src.broker_adapter import OctaBrokerAdapter
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -306,95 +312,55 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         except Exception as e:
             logger.warning("Ensemble note: %s", e)
 
-    # High-Accuracy Confluence Direction Engine (Accurate Setup Formulation)
-    risk_dist = round(max(atr_val * 1.5, 4.50), 2)  # Hardened 45-60 pip risk buffer
+    # Phase 2 Strategy Layer Evaluation (Deterministic Entry Engines)
+    df_h1_data = df_h1 if 'df_h1' in locals() and df_h1 is not None else None
+    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df, df_h1_data)
+    sig_donchian = DonchianBreakoutStrategy.evaluate(df, df_h1_data)
+    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df, df_h1_data)
 
-    # Multi-factor score
-    long_score = 0
-    short_score = 0
-
-    # Macro H1 Trend Bias is dominant (4 points)
-    if h1_trend_bias == 1:
-        long_score += 4
-    elif h1_trend_bias == -1:
-        short_score += 4
-
-    if current_price > ema_20:
-        long_score += 2
-    else:
-        short_score += 2
-
-    if is_strong_bull:
-        long_score += 2
-    elif is_strong_bear:
-        short_score += 2
-
-    if buyer_pct > seller_pct:
-        long_score += 2
-    else:
-        short_score += 2
-
-    if sweep_low_confirmed or (current_price <= recent_low_20 + 2.0 and rsi_val <= 40.0):
-        long_score += 3
-    if sweep_high_confirmed or (current_price >= recent_high_20 - 2.0 and rsi_val >= 60.0):
-        short_score += 3
-
-    # RSI overbought/oversold protections
-    if rsi_val >= 70.0:
-        long_score -= 4
-    if rsi_val <= 30.0:
-        short_score -= 4
-
-    if long_score > short_score:
-        action = "BUY"
-    elif short_score > long_score:
-        action = "SELL"
-    else:
-        action = "BUY" if h1_trend_bias == 1 else "SELL"
-
-    if action == "BUY":
-        entry = round(current_price, 2)
-        sl = round(entry - risk_dist, 2)
-        risk = max(entry - sl, 3.50)
-        tp1 = round(entry + (risk * 1.5), 2)
-        tp2 = round(entry + (risk * 2.8), 2)
-        be_trigger = round(entry + 2.00, 2)
-        confidence = min(95.0, max(82.0, round(ml_confidence + 4.0, 1)))
-        why = (
-            f"• 1. Structure: Bullish Alignment (EMA 20 > EMA 50, RSI {rsi_val:.1f} Safe).\n"
-            f"• 2. Confluence: Order Flow Dominance (🟢 {buyer_pct}% Buyers vs 🔴 {seller_pct}% Sellers).\n"
-            f"• 3. Session: Active in `{session_name}`.\n"
-            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
-            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
-        )
-    else:
-        entry = round(current_price, 2)
-        sl = round(entry + risk_dist, 2)
-        risk = max(sl - entry, 3.50)
-        tp1 = round(entry - (risk * 1.5), 2)
-        tp2 = round(entry - (risk * 2.8), 2)
-        be_trigger = round(entry - 2.00, 2)
-        confidence = min(95.0, max(82.0, round(ml_confidence + 4.0, 1)))
-        why = (
-            f"• 1. Structure: Bearish Exhaustion/Rejection (EMA 20 < EMA 50, RSI {rsi_val:.1f} Safe).\n"
-            f"• 2. Confluence: Seller Flow Dominance (🔴 {seller_pct}% Sellers vs 🟢 {buyer_pct}% Buyers).\n"
-            f"• 3. Session: Active in `{session_name}`.\n"
-            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
-            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
-        )
-
-    # Phase 2 Strategy Layer Evaluation
-    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df, df_h1 if 'df_h1' in locals() and df_h1 is not None else None)
-    sig_donchian = DonchianBreakoutStrategy.evaluate(df)
-    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df)
-
-    active_strategy = "H1_TREND_PULLBACK"
+    # Strategy Priority: 1. Value Pullback (Highest Expectancy) -> 2. Breakout -> 3. Squeeze
+    chosen_sig = None
     if sig_pullback.action != "HOLD":
-        active_strategy = sig_pullback.strategy_name
+        chosen_sig = sig_pullback
     elif sig_donchian.action != "HOLD":
-        active_strategy = sig_donchian.strategy_name
+        chosen_sig = sig_donchian
     elif sig_squeeze.action != "HOLD":
-        active_strategy = sig_squeeze.strategy_name
+        chosen_sig = sig_squeeze
+
+    if chosen_sig is None or chosen_sig.action == "HOLD":
+        action = "HOLD"
+        entry = current_price
+        sl = current_price
+        tp1 = current_price
+        tp2 = current_price
+        be_trigger = current_price
+        risk_dist = 0.0
+        active_strategy = "WAITING_FOR_PULLBACK (HOLD)"
+        confidence = 50.0
+        why = (
+            f"• 1. Structure: Market in {regime} | {session_name}.\n"
+            f"• 2. Strategy Verdict: No clean H1 value pullback or breakout confirmed.\n"
+            f"• 3. Risk Guard: Capital strictly preserved on sidelines (0 risk exposure).\n"
+            f"• 4. Indicators: RSI at {rsi_val:.1f} (Neutral/Wait), Buyer Flow {buyer_pct}% vs {seller_pct}%.\n"
+            f"• 5. Action: Standing by for high-probability H1 EMA 20/50 test."
+        )
+    else:
+        action = chosen_sig.action
+        entry = chosen_sig.entry
+        sl = chosen_sig.sl
+        tp1 = chosen_sig.tp1
+        tp2 = chosen_sig.tp2
+        be_trigger = chosen_sig.be_trigger
+        risk_dist = chosen_sig.risk_pips / 10.0
+        active_strategy = chosen_sig.strategy_name
+        confidence = min(95.0, max(82.0, round(ml_confidence + 4.0, 1)))
+        why = (
+            f"• 1. Strategy Engine: `{active_strategy}` ({chosen_sig.action}).\n"
+            f"• 2. Rationale: {chosen_sig.rationale}\n"
+            f"• 3. Session: Active in `{session_name}`.\n"
+            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
+            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
+        )
 
     # Phase 2 ML Meta-Filter Expected R Evaluation (Strict +0.15R Hurdle)
     ml_verdict = meta_filter.evaluate_candidate(action, df, h1_trend_bias, h1_dist_ema50, min_expected_R=0.15)
@@ -441,6 +407,23 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
 
 
 def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str:
+    if setup["action"] == "HOLD":
+        return (
+            f"⏸️ *MARKET CONSOLIDATION (HOLD)*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 *Asset*: XAUUSD (Gold - M5 Live)\n"
+            f"💵 *Live Market Price*: `${setup['price']:.2f}`\n"
+            f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n\n"
+            f"🛡️ *Capital Preservation Mode Active*\n"
+            f"• No high-probability pullback or breakout confirmed.\n"
+            f"• Risk Governor status: Standing down (0 active exposure).\n"
+            f"• ML Meta-Filter: ABSTAIN (Waiting for high-expectancy setup).\n"
+            f"• Indicators: RSI at `{setup.get('rsi', 50.0)}` | Volume: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n\n"
+            f"{setup['why']}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 *Commands*: `/trade` | `/demo` | `/status` | `/audit`"
+        )
+
     icon = "🔴" if setup["action"] == "SELL" else "🟢"
     lot_disp = setup.get("lot_size", 0.01) if setup.get("lot_size", 0.0) > 0 else 0.01
     risk_usd_disp = setup.get("risk_usd", 0.50) if setup.get("risk_usd", 0.0) > 0 else 0.50
@@ -464,10 +447,10 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"🚦 *Risk Governor*: {risk_status_disp}\n"
         f"📈 *Broker Audited Win Rate*: `{setup['win_rate']}%` ({setup.get('win_count', 0)}W / {setup.get('loss_count', 0)}L)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *6-PILLAR INSTITUTIONAL ANALYSIS*:\n"
+        f"📊 *INSTITUTIONAL ANALYSIS*:\n"
         f"{setup['why']}\n"
         f"• *Signed Volume Proxy*: 🟢 {setup['buyer_pct']}% Buyers vs 🔴 {setup['seller_pct']}% Sellers\n"
-        f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,685 M5 Bars)\n"
+        f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,792 M5 Bars)\n"
         f"• *Execution Engine*: Octa Shadow Broker (Floating Spread & 50ms Slippage)\n"
         f"• *Signal Journal*: Logged to `reports/signal_journal.jsonl`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -681,9 +664,8 @@ def run_24_7_service():
                                 signal_id=ev.split()[1] if len(ev.split()) > 1 else "unknown",
                                 outcome="WIN" if "TAKE_PROFIT" in ev else ("BREAK_EVEN" if "BREAK_EVEN" in ev else "LOSS"),
                                 exit_price=current_close,
-                                pnl_pips=0.0,
-                                pnl_R=0.0,
-                                exit_timestamp=candle_bar_time,
+                                net_pnl_usd=0.0,
+                                net_R=0.0,
                             )
 
                     # 2. Check Legacy Prediction Outcomes (TP, SL, Break-Even)
@@ -728,8 +710,8 @@ def run_24_7_service():
                                 bar_timestamp=candle_bar_time,
                             )
 
-                            # 2. Gating: ONLY dispatch to Telegram & broker execute if BOTH ML filter and Risk Governor approve!
-                            is_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE"
+                            # 2. Gating: ONLY dispatch to Telegram & broker execute if BOTH ML filter and Risk Governor approve AND action != HOLD!
+                            is_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE" and setup["action"] != "HOLD"
                             if is_actionable:
                                 card = format_card(setup, "24/7 MASTER AI SIGNAL")
                                 for cid in list(subscribers):
