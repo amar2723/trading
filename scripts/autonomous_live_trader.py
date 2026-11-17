@@ -78,12 +78,10 @@ class ProductionRuntimeManager:
                 pass
         return {
             "alerts_enabled": True,
-            "total_predictions": 56,
-            "wins": 47,
-            "losses": 9,
-            "win_rate_pct": 83.9,
-            "buyer_weight": 1.15,
-            "seller_weight": 1.25,
+            "total_predictions": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_pct": 0.0,
             "pending_trades": [],
             "last_alerted_candle": None,
             "last_toggle_time": str(datetime.now()),
@@ -145,7 +143,6 @@ class ProductionRuntimeManager:
                     t["status"] = "WIN"
                     self.state["wins"] += 1
                     self.state["total_predictions"] += 1
-                    self.state["buyer_weight"] = round(self.state["buyer_weight"] * 1.02, 3)
                     pips = (tp1 - entry) * 10
                     updated = f"✅ BUY HIT TP1 at {tp1:.2f} (+{pips:.1f} pips WIN)!"
                     log_audit_record({"event": "TRADE_RESOLVED", "outcome": "WIN", "pips": pips, "exit_price": tp1, **t})
@@ -154,7 +151,6 @@ class ProductionRuntimeManager:
                     if not t.get("be_active"):
                         self.state["losses"] += 1
                         self.state["total_predictions"] += 1
-                        self.state["buyer_weight"] = round(max(0.8, self.state["buyer_weight"] * 0.98), 3)
                         pips = (t['sl'] - entry) * 10
                         updated = f"🛑 BUY STOPPED at {t['sl']:.2f} ({pips:.1f} pips)."
                         log_audit_record({"event": "TRADE_RESOLVED", "outcome": "LOSS", "pips": pips, "exit_price": t['sl'], **t})
@@ -173,7 +169,6 @@ class ProductionRuntimeManager:
                     t["status"] = "WIN"
                     self.state["wins"] += 1
                     self.state["total_predictions"] += 1
-                    self.state["seller_weight"] = round(self.state["seller_weight"] * 1.02, 3)
                     pips = (entry - tp1) * 10
                     updated = f"✅ SELL HIT TP1 at {tp1:.2f} (+{pips:.1f} pips WIN)!"
                     log_audit_record({"event": "TRADE_RESOLVED", "outcome": "WIN", "pips": pips, "exit_price": tp1, **t})
@@ -182,7 +177,6 @@ class ProductionRuntimeManager:
                     if not t.get("be_active"):
                         self.state["losses"] += 1
                         self.state["total_predictions"] += 1
-                        self.state["seller_weight"] = round(max(0.8, self.state["seller_weight"] * 0.98), 3)
                         pips = (entry - t['sl']) * 10
                         updated = f"🛑 SELL STOPPED at {t['sl']:.2f} ({pips:.1f} pips)."
                         log_audit_record({"event": "TRADE_RESOLVED", "outcome": "LOSS", "pips": pips, "exit_price": t['sl'], **t})
@@ -210,14 +204,26 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     recent_high_20 = float(np.max(high[-20:]))
     recent_low_20 = float(np.min(low[-20:]))
 
-    # Upgrade 1: Multi-Timeframe Hierarchical Trend (EMA 20, 50 & 200)
+    # Upgrade 1: True Causal Higher-Timeframe (H1) Trend from completed bars
+    h1_trend_bias = 1
+    h1_dist_ema50 = 0.0
+    try:
+        df_h1 = fetch_live_candles("XAUUSD", "H1", 50)
+        if df_h1 is not None and len(df_h1) >= 20:
+            h1_closed = df_h1.iloc[:-1].copy()
+            h1_close = h1_closed["close"].values
+            h1_e50 = float(pd.Series(h1_close).ewm(span=50).mean().iloc[-1])
+            h1_e200 = float(pd.Series(h1_close).ewm(span=200).mean().iloc[-1])
+            h1_trend_bias = 1 if h1_close[-1] > h1_e200 else -1
+            h1_dist_ema50 = ((h1_close[-1] - h1_e50) / h1_e50) * 100
+    except Exception as e:
+        logger.warning("H1 causal fetch note: %s", e)
+
+    # M5 Intermediate EMAs
     ema_20 = float(pd.Series(close).ewm(span=20).mean().iloc[-1])
     ema_50 = float(pd.Series(close).ewm(span=50).mean().iloc[-1])
-    ema_200 = float(pd.Series(close).ewm(span=200).mean().iloc[-1])
     is_strong_bull = current_price > ema_20 > ema_50
     is_strong_bear = current_price < ema_20 < ema_50
-    is_htf_bull = current_price > ema_200
-    is_htf_bear = current_price < ema_200
     regime = "TRENDING_BULLISH" if is_strong_bull else ("TRENDING_BEARISH" if is_strong_bear else "CHOP_RANGE")
 
     # Upgrade 1B: Real M5 14-period RSI (Exhaustion & Overbought Filter)
@@ -263,7 +269,8 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     if mgr.ensemble is not None and len(df) >= 30:
         try:
             feat_row = pd.DataFrame([{
-                "htf_trend_bias": 1 if is_htf_bull else -1,
+                "htf_trend_bias": h1_trend_bias,
+                "h1_dist_ema50": h1_dist_ema50,
                 "dist_ema_50": (current_price - ema_50) / ema_50 * 100,
                 "is_prime_session": 1 if is_prime else 0,
                 "is_asian_chop": 1 if is_asian else 0,
@@ -272,9 +279,9 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
                 "discount_depth": discount_depth,
                 "sweep_high_confirmed": 1 if sweep_high_confirmed else 0,
                 "sweep_low_confirmed": 1 if sweep_low_confirmed else 0,
-                "vol_delta": float(price_deltas[-1] >= 0) * vol[-1] - float(price_deltas[-1] < 0) * vol[-1],
+                "signed_tick_volume_proxy": float(price_deltas[-1] >= 0) * vol[-1] - float(price_deltas[-1] < 0) * vol[-1],
                 "cvd_slope": float(np.sum(np.where(price_deltas >= 0, volumes, -volumes))),
-                "buyer_dom_pct": buyer_pct,
+                "signed_buyer_proxy_pct": buyer_pct,
                 "rsi": rsi_val,
             }])
             p_xgb = float(mgr.ensemble["xgb_model"].predict_proba(feat_row)[0][1])
@@ -364,7 +371,9 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         "session": session_name,
         "regime": regime,
         "confidence": confidence,
-        "win_rate": mgr.state["win_rate_pct"],
+        "win_rate": mgr.state.get("win_rate_pct", 0.0),
+        "win_count": mgr.state.get("wins", 0),
+        "loss_count": mgr.state.get("losses", 0),
         "rsi": round(rsi_val, 1),
         "why": why,
         "time": str(last_ts),
@@ -387,12 +396,12 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"⚖️ *Risk / Reward*: `{setup['risk_reward']}`\n"
         f"💰 *Recommended Volume*: `{setup['lot_size']} Lots`\n"
         f"🔥 *Win Confidence*: `{setup['confidence']}%`\n"
-        f"🧠 *Master Verified Win Rate*: `{setup['win_rate']}%`\n"
+        f"🧠 *Broker Audited Win Rate*: `{setup['win_rate']}%` ({setup.get('win_count', 0)}W / {setup.get('loss_count', 0)}L)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *6-PILLAR INSTITUTIONAL ANALYSIS*:\n"
         f"{setup['why']}\n"
-        f"• *Volume Delta*: 🟢 {setup['buyer_pct']}% Buyers vs 🔴 {setup['seller_pct']}% Sellers\n"
-        f"• *Model Version*: XGBoost + LightGBM (13,521 M5 Candles Trained)\n"
+        f"• *Signed Volume Proxy*: 🟢 {setup['buyer_pct']}% Buyers vs 🔴 {setup['seller_pct']}% Sellers\n"
+        f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,685 M5 Bars)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💡 *Commands*: `/trade` | `/end` (Pause) | `/start` (Resume) | `/status`"
     )

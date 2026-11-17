@@ -35,69 +35,83 @@ def build_master_dataset() -> tuple[pd.DataFrame, pd.Series]:
     h1_path = ROOT / "data/raw/XAUUSD_1H_2years.csv"
 
     df_m5 = pd.read_csv(m5_path)
-    logger.info("Loaded %d M5 bars", len(df_m5))
+    df_h1 = pd.read_csv(h1_path)
+    logger.info("Loaded %d M5 bars and %d H1 bars", len(df_m5), len(df_h1))
+
+    # 1. Causal Higher-Timeframe (H1) Integration
+    df_h1["timestamp"] = pd.to_datetime(df_h1["timestamp"])
+    df_h1 = df_h1.sort_values("timestamp").reset_index(drop=True)
+    df_h1["h1_ema_50"] = df_h1["close"].ewm(span=50).mean()
+    df_h1["h1_ema_200"] = df_h1["close"].ewm(span=200).mean()
+    
+    # Strictly lag H1 by 1 closed bar: M5 bars only ever observe completed past H1 bars
+    df_h1["htf_trend_bias"] = np.where(df_h1["close"] > df_h1["h1_ema_200"], 1, -1)
+    df_h1["htf_trend_bias"] = df_h1["htf_trend_bias"].shift(1)
+    df_h1["h1_dist_ema50"] = ((df_h1["close"] - df_h1["h1_ema_50"]) / df_h1["h1_ema_50"] * 100).shift(1)
+    df_h1_sub = df_h1[["timestamp", "htf_trend_bias", "h1_dist_ema50"]].dropna()
+
+    df_m5["timestamp"] = pd.to_datetime(df_m5["timestamp"])
+    df_m5 = df_m5.sort_values("timestamp").reset_index(drop=True)
+    # Causal backward asof merge
+    df_m5 = pd.merge_asof(df_m5, df_h1_sub, on="timestamp", direction="backward")
 
     close = df_m5["close"].values
     high = df_m5["high"].values
     low = df_m5["low"].values
     vol = df_m5["volume"].values
-    timestamps = pd.to_datetime(df_m5["timestamp"])
+    timestamps = df_m5["timestamp"]
     n = len(df_m5)
 
-    # 1. Multi-Timeframe Trend & EMAs
+    # 2. M5 Indicators without Look-Ahead (.bfill strictly eliminated)
     df_m5["ema_9"] = pd.Series(close).ewm(span=9).mean()
     df_m5["ema_21"] = pd.Series(close).ewm(span=21).mean()
     df_m5["ema_50"] = pd.Series(close).ewm(span=50).mean()
-    df_m5["ema_200"] = pd.Series(close).ewm(span=200).mean()
-    df_m5["htf_trend_bias"] = np.where(df_m5["close"] > df_m5["ema_200"], 1, -1)
     df_m5["dist_ema_50"] = (df_m5["close"] - df_m5["ema_50"]) / df_m5["ema_50"] * 100
 
-    # 2. Session Killzones
+    # Session Killzones
     hours = timestamps.dt.hour.values
     df_m5["is_london"] = np.isin(hours, [7, 8, 9, 10]).astype(int)
     df_m5["is_ny_overlap"] = np.isin(hours, [12, 13, 14, 15, 16]).astype(int)
     df_m5["is_prime_session"] = np.isin(hours, [7, 8, 9, 10, 12, 13, 14, 15, 16]).astype(int)
     df_m5["is_asian_chop"] = np.isin(hours, [0, 1, 2, 3, 4, 5, 6]).astype(int)
 
-    # 3. Volatility & Normalized ATR
+    # Volatility & ATR (True causal, no future fill)
     tr1 = high - low
     tr2 = np.abs(high - np.roll(close, 1))
     tr3 = np.abs(low - np.roll(close, 1))
     tr = np.maximum(tr1, np.maximum(tr2, tr3))
     tr[0] = tr1[0]
-    df_m5["atr"] = pd.Series(tr).rolling(14).mean().bfill()
+    df_m5["atr"] = pd.Series(tr).rolling(14).mean()
     df_m5["atr_pct"] = df_m5["atr"] / df_m5["close"] * 100
-    df_m5["volatility_expansion"] = (df_m5["atr"] / pd.Series(df_m5["atr"]).rolling(50).mean().bfill()).bfill()
+    df_m5["volatility_expansion"] = df_m5["atr"] / pd.Series(df_m5["atr"]).rolling(50).mean()
 
-    # 4. Premium/Discount Depth & Liquidity Sweeps
-    roll_h20 = pd.Series(high).rolling(20).max().shift(1).bfill().values
-    roll_l20 = pd.Series(low).rolling(20).min().shift(1).bfill().values
+    # Premium/Discount Depth & Sweeps (Strictly shifted by 1 past bar)
+    roll_h20 = pd.Series(high).rolling(20).max().shift(1).values
+    roll_l20 = pd.Series(low).rolling(20).min().shift(1).values
     span = np.maximum(roll_h20 - roll_l20, 0.1)
     df_m5["discount_depth"] = (close - roll_l20) / span
-
     df_m5["sweep_high_confirmed"] = ((high > roll_h20) & (close < roll_h20)).astype(int)
     df_m5["sweep_low_confirmed"] = ((low < roll_l20) & (close > roll_l20)).astype(int)
 
-    # 5. Order Flow: Tick Volume Delta & CVD Slope
+    # Order Flow Proxies (Causal signed tick volume, honest names)
     p_diff = np.diff(close, prepend=close[0])
     v_delta = np.where(p_diff >= 0, vol, -vol)
-    df_m5["vol_delta"] = v_delta
+    df_m5["signed_tick_volume_proxy"] = v_delta
     df_m5["cvd"] = np.cumsum(v_delta)
-    df_m5["cvd_slope"] = pd.Series(df_m5["cvd"]).diff(10).bfill()
+    df_m5["cvd_slope"] = pd.Series(df_m5["cvd"]).diff(10)
 
-    # Rolling buyer dominance %
-    rolling_buy = pd.Series(np.where(p_diff >= 0, vol, 0.0)).rolling(14).sum().bfill()
-    rolling_tot = pd.Series(vol).rolling(14).sum().bfill()
-    df_m5["buyer_dom_pct"] = (rolling_buy / np.maximum(rolling_tot, 1.0)) * 100
+    rolling_buy = pd.Series(np.where(p_diff >= 0, vol, 0.0)).rolling(14).sum()
+    rolling_tot = pd.Series(vol).rolling(14).sum()
+    df_m5["signed_buyer_proxy_pct"] = (rolling_buy / np.maximum(rolling_tot, 1.0)) * 100
 
-    # 6. Momentum & RSI
+    # RSI (No future fill)
     delta_s = pd.Series(close).diff()
-    gain = delta_s.where(delta_s > 0, 0.0).rolling(14).mean().bfill()
-    loss = (-delta_s.where(delta_s < 0, 0.0)).rolling(14).mean().bfill()
+    gain = delta_s.where(delta_s > 0, 0.0).rolling(14).mean()
+    loss = (-delta_s.where(delta_s < 0, 0.0)).rolling(14).mean()
     rs = gain / np.maximum(loss, 1e-6)
     df_m5["rsi"] = 100 - (100 / (1 + rs))
 
-    # Target Labeling with Dynamic Break-Even & 1:2 R:R Shield
+    # Rigorous Target Labeling (BE is NOT a Win, SL before TP is 0)
     targets = []
     for i in range(n):
         if i >= n - 15:
@@ -105,63 +119,67 @@ def build_master_dataset() -> tuple[pd.DataFrame, pd.Series]:
             continue
 
         entry = close[i]
-        curr_atr = df_m5["atr"].iloc[i]
-        sl_dist = max(curr_atr * 1.2, 2.5) # Dynamic ATR SL
-        tp_dist = sl_dist * 1.8           # TP1 Target
-        be_dist = sl_dist * 0.8           # Break-Even threshold
+        curr_atr = df_m5["atr"].iloc[i] if pd.notnull(df_m5["atr"].iloc[i]) else 3.0
+        sl_dist = max(curr_atr * 1.25, 3.0) # Realistic SL buffer
+        tp_dist = sl_dist * 1.5           # 1:1.5 Risk-Reward Target
 
         f_high = high[i+1 : min(n, i+16)]
         f_low = low[i+1 : min(n, i+16)]
 
-        # Determine directional setup
-        # If in premium or sweep high -> Short
-        # If in discount or sweep low -> Long
+        # Setup direction determination
         is_short = (df_m5["discount_depth"].iloc[i] > 0.65) or (df_m5["sweep_high_confirmed"].iloc[i] == 1) or (df_m5["htf_trend_bias"].iloc[i] == -1)
 
         hit_win = False
-        hit_be = False
+        hit_loss = False
 
         if is_short:
             current_sl = entry + sl_dist
             tp_target = entry - tp_dist
-            be_target = entry - be_dist
 
             for h_val, l_val in zip(f_high, f_low):
-                if not hit_be and l_val <= be_target:
-                    hit_be = True
-                    current_sl = entry # Protected to BE!
-                if l_val <= tp_target:
-                    hit_win = True
+                # Conservative same-bar tie-breaker: if both hit in the same bar, assume SL hit first
+                if h_val >= current_sl and l_val <= tp_target:
+                    hit_loss = True
                     break
                 if h_val >= current_sl:
+                    hit_loss = True
+                    break
+                if l_val <= tp_target:
+                    hit_win = True
                     break
         else:
             current_sl = entry - sl_dist
             tp_target = entry + tp_dist
-            be_target = entry + be_dist
 
             for h_val, l_val in zip(f_high, f_low):
-                if not hit_be and h_val >= be_target:
-                    hit_be = True
-                    current_sl = entry
+                # Conservative same-bar tie-breaker
+                if l_val <= current_sl and h_val >= tp_target:
+                    hit_loss = True
+                    break
+                if l_val <= current_sl:
+                    hit_loss = True
+                    break
                 if h_val >= tp_target:
                     hit_win = True
                     break
-                if l_val <= current_sl:
-                    break
 
-        targets.append(1 if hit_win else (1 if hit_be else 0))
+        # STRICT TARGET: 1 ONLY if TP hit without hitting SL. BE or timeouts are 0!
+        targets.append(1 if hit_win else 0)
 
     df_m5["target"] = targets
 
+    # Drop warm-up rows (eliminates all NaNs causally without lookahead)
     feature_cols = [
-        "htf_trend_bias", "dist_ema_50", "is_prime_session", "is_asian_chop",
+        "htf_trend_bias", "h1_dist_ema50", "dist_ema_50", "is_prime_session", "is_asian_chop",
         "atr_pct", "volatility_expansion", "discount_depth",
         "sweep_high_confirmed", "sweep_low_confirmed",
-        "vol_delta", "cvd_slope", "buyer_dom_pct", "rsi"
+        "signed_tick_volume_proxy", "cvd_slope", "signed_buyer_proxy_pct", "rsi"
     ]
-    X = df_m5[feature_cols].copy()
-    y = df_m5["target"].copy()
+    df_clean = df_m5[feature_cols + ["target"]].dropna().reset_index(drop=True)
+    logger.info("Clean dataset after discarding warm-up rows: %d samples", len(df_clean))
+    
+    X = df_clean[feature_cols].copy()
+    y = df_clean["target"].copy()
     return X, y
 
 
