@@ -177,13 +177,22 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     recent_high_20 = float(np.max(high[-20:]))
     recent_low_20 = float(np.min(low[-20:]))
 
-    # Upgrade 1: Multi-Timeframe Hierarchical Trend (EMA 50 & 200)
-    ema_21 = float(pd.Series(close).ewm(span=21).mean().iloc[-1])
+    # Upgrade 1: Multi-Timeframe Hierarchical Trend (EMA 20, 50 & 200)
+    ema_20 = float(pd.Series(close).ewm(span=20).mean().iloc[-1])
     ema_50 = float(pd.Series(close).ewm(span=50).mean().iloc[-1])
     ema_200 = float(pd.Series(close).ewm(span=200).mean().iloc[-1])
+    is_strong_bull = current_price > ema_20 > ema_50
+    is_strong_bear = current_price < ema_20 < ema_50
     is_htf_bull = current_price > ema_200
     is_htf_bear = current_price < ema_200
-    regime = "TRENDING_BEARISH" if is_htf_bear else "TRENDING_BULLISH"
+    regime = "TRENDING_BULLISH" if is_strong_bull else ("TRENDING_BEARISH" if is_strong_bear else "CHOP_RANGE")
+
+    # Upgrade 1B: Real M5 14-period RSI (Exhaustion & Overbought Filter)
+    diffs = pd.Series(close).diff()
+    gain = diffs.clip(lower=0).rolling(14).mean()
+    loss = (-diffs.clip(upper=0)).rolling(14).mean()
+    rs = gain / (loss + 1e-9)
+    rsi_val = float((100 - (100 / (1 + rs))).iloc[-1])
 
     # Upgrade 2: Session Killzone Detection
     is_london = 7 <= curr_hour <= 10
@@ -195,7 +204,7 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     # Upgrade 3: Dynamic ATR Volatility Sizing
     tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
     atr_val = float(pd.Series(tr).rolling(14).mean().iloc[-1])
-    atr_sl_dist = round(max(atr_val * 1.25, 2.50), 2)  # Dynamic buffer
+    atr_sl_dist = round(max(atr_val * 1.5, 3.0), 2)  # Hardened 3.0+ pt buffer
 
     # Upgrade 4: Liquidity Sweep Confirmation (Post-Judas Filter)
     prev_h20 = float(pd.Series(high).rolling(20).max().shift(1).iloc[-1])
@@ -217,7 +226,7 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     discount_depth = (current_price - recent_low_20) / range_span
 
     # Master Ensemble Inference
-    ml_confidence = 82.0
+    ml_confidence = 80.0
     if mgr.ensemble is not None and len(df) >= 30:
         try:
             feat_row = pd.DataFrame([{
@@ -233,7 +242,7 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
                 "vol_delta": float(price_deltas[-1] >= 0) * vol[-1] - float(price_deltas[-1] < 0) * vol[-1],
                 "cvd_slope": float(np.sum(np.where(price_deltas >= 0, volumes, -volumes))),
                 "buyer_dom_pct": buyer_pct,
-                "rsi": 50.0,
+                "rsi": rsi_val,
             }])
             p_xgb = float(mgr.ensemble["xgb_model"].predict_proba(feat_row)[0][1])
             p_lgb = float(mgr.ensemble["lgb_model"].predict_proba(feat_row)[0][1])
@@ -241,60 +250,57 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         except Exception as e:
             logger.warning("Ensemble note: %s", e)
 
-    # Formulate High-Confluence Setup using the 6 Upgrades
-    # Case A: Sweep Low or Extreme Discount -> Reversal BUY
-    if sweep_low_confirmed or discount_depth <= 0.20 or current_price <= recent_low_20 + 2.5:
+    # Hardened Confluence Engine (No Default Biases)
+    is_bullish_candle = close[-1] > df["open"].values[-1]
+    is_bearish_candle = close[-1] < df["open"].values[-1]
+
+    action = "HOLD"
+    confidence = 50.0
+    entry = round(current_price, 2)
+    sl = entry
+    tp1 = entry
+    tp2 = entry
+    be_trigger = entry
+    why = "Market consolidating without high-probability edge. Standing aside."
+
+    # Case A: HIGH PROBABILITY BUY
+    # Rules: NOT overbought (RSI < 68), candle confirmed green, NOT falling knife
+    can_buy = rsi_val < 68.0 and is_bullish_candle and (not is_strong_bear or sweep_low_confirmed)
+    if can_buy and (sweep_low_confirmed or (is_strong_bull and discount_depth <= 0.45) or (discount_depth <= 0.15 and buyer_pct >= 55.0)):
         action = "BUY"
         entry = round(current_price, 2)
-        sl = round(recent_low_20 - atr_sl_dist, 2)
+        sl = round(min(recent_low_20 - atr_sl_dist, entry - atr_sl_dist), 2)
         risk = max(entry - sl, 2.50)
-        tp1 = round(entry + (risk * 1.8), 2)
-        tp2 = round(entry + (risk * 3.0), 2)
+        tp1 = round(entry + (risk * 1.5), 2)
+        tp2 = round(entry + (risk * 2.8), 2)
         be_trigger = round(entry + 2.00, 2)
-        confidence = min(95.0, max(78.0, round(ml_confidence + 8.0, 1)))
+        confidence = min(94.0, max(80.0, round(ml_confidence + 6.0, 1)))
         why = (
-            f"• 1. Multi-Timeframe: Session Demand Shelf Support at ${recent_low_20:.2f}.\n"
-            f"• 2. Sweep Filter: Low swept & confirmed with rejection wick.\n"
+            f"• 1. Structure: Reversal/Bounce confirmed (RSI {rsi_val:.1f} Safe, Green Candle).\n"
+            f"• 2. Confluence: {'Liquidity Sweep Low' if sweep_low_confirmed else 'Trend EMA Pullback'}.\n"
             f"• 3. Session: Active in `{session_name}`.\n"
-            f"• 4. Dynamic BE Shield: SL moves to ${entry:.2f} (Risk-Free) once price hits ${be_trigger:.2f} (+20 pips).\n"
-            f"• 5. Volatility ATR: SL buffered at ${sl:.2f} ({atr_sl_dist:.2f} pts).\n"
-            f"• 6. Master Ensemble: Dual XGBoost+LightGBM score: {confidence}%."
+            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({atr_sl_dist:.2f} pts), BE at +20 pips.\n"
+            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM)."
         )
 
-    # Case B: Sweep High or Premium Continuation -> Trend SELL
-    elif sweep_high_confirmed or seller_pct >= 52.0 or is_htf_bear:
+    # Case B: HIGH PROBABILITY SELL
+    # Rules: NOT oversold (RSI > 32), candle confirmed red, NOT fighting strong bull breakout
+    can_sell = rsi_val > 32.0 and is_bearish_candle and (not is_strong_bull or sweep_high_confirmed)
+    if can_sell and (sweep_high_confirmed or (is_strong_bear and discount_depth >= 0.55) or (discount_depth >= 0.85 and seller_pct >= 55.0)):
         action = "SELL"
-        entry = round(current_price + (recent_high_20 - current_price) * 0.236, 2)
-        if entry < current_price:
-            entry = round(current_price, 2)
+        entry = round(current_price, 2)
         sl = round(max(recent_high_20 + atr_sl_dist, entry + atr_sl_dist), 2)
         risk = max(sl - entry, 2.50)
-        tp1 = round(entry - (risk * 1.8), 2)
-        tp2 = round(entry - (risk * 3.0), 2)
+        tp1 = round(entry - (risk * 1.5), 2)
+        tp2 = round(entry - (risk * 2.8), 2)
         be_trigger = round(entry - 2.00, 2)
-        confidence = min(96.0, max(80.0, round(ml_confidence + 10.0, 1)))
+        confidence = min(94.0, max(80.0, round(ml_confidence + 6.0, 1)))
         why = (
-            f"• 1. Multi-Timeframe: H1 Macro Trend is Bearish (Price below 200 EMA).\n"
-            f"• 2. Sweep Filter: Retesting unmitigated Bearish FVG / Order Block.\n"
+            f"• 1. Structure: Bearish Exhaustion confirmed (RSI {rsi_val:.1f} Safe, Red Candle).\n"
+            f"• 2. Confluence: {'Liquidity Sweep High' if sweep_high_confirmed else 'Trend EMA Rejection'}.\n"
             f"• 3. Session: Active in `{session_name}`.\n"
-            f"• 4. Dynamic BE Shield: SL moves to ${entry:.2f} (Risk-Free) once price hits ${be_trigger:.2f} (+20 pips).\n"
-            f"• 5. Volatility ATR: SL buffered at ${sl:.2f} ({atr_sl_dist:.2f} pts).\n"
-            f"• 6. Master Ensemble: Dual XGBoost+LightGBM score: {confidence}%."
-        )
-
-    else:
-        action = "BUY"
-        entry = round(current_price, 2)
-        sl = round(recent_low_20 - atr_sl_dist, 2)
-        risk = max(entry - sl, 2.50)
-        tp1 = round(entry + (risk * 1.8), 2)
-        tp2 = round(entry + (risk * 3.0), 2)
-        be_trigger = round(entry + 2.00, 2)
-        confidence = min(92.0, max(75.0, ml_confidence))
-        why = (
-            f"• 1. Multi-Timeframe: Microstructure consolidation bounce.\n"
-            f"• 2. Session: Active in `{session_name}`.\n"
-            f"• 3. BE Shield: SL moves to Entry at ${be_trigger:.2f}."
+            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({atr_sl_dist:.2f} pts), BE at +20 pips.\n"
+            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM)."
         )
 
     return {
@@ -477,11 +483,17 @@ def run_24_7_service():
                 last_scan_time = now
                 try:
                     df = fetch_live_candles("XAUUSD", "M5", 50)
+                    if df is None or df.empty or len(df) < 30 or float(df["close"].iloc[-1]) < 3000.0:
+                        logger.warning("Live candle feed unavailable or invalid (< 3000). Skipping cycle safely.")
+                        time.sleep(2)
+                        continue
+
                     last_row = df.iloc[-1]
                     current_candle_time = str(last_row["timestamp"])
+                    current_close = float(last_row["close"])
 
                     update_note = mgr.update_from_candle(
-                        float(last_row["high"]), float(last_row["low"]), float(last_row["close"])
+                        float(last_row["high"]), float(last_row["low"]), current_close
                     )
                     if update_note:
                         logger.info("Master Learner: %s", update_note)
@@ -489,10 +501,27 @@ def run_24_7_service():
                     if mgr.is_alerts_enabled():
                         if current_candle_time != mgr.state.get("last_alerted_candle"):
                             setup = analyze_with_6_master_upgrades(df, mgr)
-                            if setup["confidence"] >= 75.0:
-                                robust_send_telegram(token, chat_id, format_card(setup, "24/7 MASTER SIGNAL"))
-                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time)
-                                logger.info("Dispatched 24/7 Master Alert for %s at %.2f", setup["action"], setup["price"])
+                            
+                            # Filter 1: Ignore HOLD signals (no edge)
+                            if setup["action"] != "HOLD" and setup["confidence"] >= 80.0:
+                                # Filter 2: Trade Lock & Anti-Spam Check
+                                suppress_alert = False
+                                for t in mgr.state.get("pending_trades", []):
+                                    if t.get("status") == "OPEN" and t.get("action") == setup["action"]:
+                                        # If active trade is underwater, DO NOT double down / catch knives!
+                                        if setup["action"] == "BUY" and current_close < t["entry"] - 1.0:
+                                            suppress_alert = True
+                                            logger.info("Suppressed duplicate BUY: Active BUY at %.2f is underwater (-%.1f pips).", t["entry"], (t["entry"] - current_close) * 10)
+                                            break
+                                        elif setup["action"] == "SELL" and current_close > t["entry"] + 1.0:
+                                            suppress_alert = True
+                                            logger.info("Suppressed duplicate SELL: Active SELL at %.2f is underwater (-%.1f pips).", t["entry"], (current_close - t["entry"]) * 10)
+                                            break
+
+                                if not suppress_alert:
+                                    robust_send_telegram(token, chat_id, format_card(setup, "24/7 MASTER SIGNAL"))
+                                    mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time)
+                                    logger.info("Dispatched 24/7 Master Alert for %s at %.2f (Confidence: %.1f%%)", setup["action"], setup["price"], setup["confidence"])
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)

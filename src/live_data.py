@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import urllib.request
 import pandas as pd
 
@@ -53,8 +54,17 @@ def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: 
 
 
 def fetch_live_candles(symbol: str = "XAUUSD", timeframe: str = "M5", bars: int = 100) -> pd.DataFrame:
-    """Fetch the latest live candles: MT5 first, web live feed fallback second."""
-    if mt5 is not None:
+    """Fetch the latest live candles via high-speed web feed first, MT5 second."""
+    # 1. High-speed Web Live Feed (Primary for 24/7 Cloud & Local)
+    try:
+        df = fetch_live_candles_web(symbol, timeframe, bars)
+        if df is not None and not df.empty and float(df["close"].iloc[-1]) > 3000.0:
+            return df
+    except Exception as exc:
+        logger.warning("Primary web live fetch attempt failed: %s", exc)
+
+    # 2. MT5 fallback if available and initialized
+    if mt5 is not None and os.environ.get("USE_MT5", "0") == "1":
         try:
             if mt5.initialize():
                 tf = TIMEFRAMES.get(timeframe.upper(), mt5.TIMEFRAME_M5)
@@ -68,16 +78,10 @@ def fetch_live_candles(symbol: str = "XAUUSD", timeframe: str = "M5", bars: int 
                         return df[["timestamp", "open", "high", "low", "close", "volume", "tick_volume", "spread"]].reset_index(drop=True)
                 mt5.shutdown()
         except Exception as exc:
-            logger.warning("MT5 live fetch failed, falling back to Web Live Feed: %s", exc)
+            logger.warning("MT5 live fetch failed: %s", exc)
 
-    # Web live stream fallback
-    try:
-        return fetch_live_candles_web(symbol, timeframe, bars)
-    except Exception as exc:
-        logger.error("Web live fetch error: %s", exc)
-        from pathlib import Path
-        data_file = Path("data/raw/XAUUSD_M5_realistic.csv")
-        return pd.read_csv(data_file).tail(bars).reset_index(drop=True)
+    logger.error("All live fetch attempts failed or returned invalid data. Returning empty DataFrame to prevent stale trade execution.")
+    return pd.DataFrame()
 
 
 def fetch_live_tick(symbol: str = "XAUUSD") -> dict:
