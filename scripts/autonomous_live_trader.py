@@ -398,11 +398,12 @@ def run_24_7_service():
         "3. 🕒 *Session Killzone Filter* (London/NY Prime)\n"
         "4. 🔒 *Dynamic Break-Even Shield* (+20 pips ➔ SL to Entry)\n"
         "5. 📏 *Volatility-Normalized ATR Stop Loss*\n"
-        "6. 🧠 *Master XGBoost + LightGBM Ensemble* (13,521 M5 bars)\n\n"
+        "6. 🧠 *Master XGBoost + LightGBM Ensemble* (13,747 M5 bars retrained)\n\n"
         f"• *Verified Win Rate*: `{mgr.state['win_rate_pct']}%`\n"
         "Tap `/trade` anytime for an immediate setup!"
     )
-    robust_send_telegram(token, chat_id, announcement)
+    for cid in subscribers:
+        robust_send_telegram(token, cid, announcement)
 
     while True:
         try:

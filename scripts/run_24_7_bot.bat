@@ -10,5 +10,5 @@ call .venv\Scripts\activate.bat
 echo [%date% %time%] Starting autonomous live trader...
 .venv\Scripts\python scripts\autonomous_live_trader.py
 echo [%date% %time%] Bot stopped or crashed with code %errorlevel%. Auto-restarting in 5 seconds...
-timeout /t 5 /nobreak
+ping 127.0.0.1 -n 6 >nul
 goto loop
