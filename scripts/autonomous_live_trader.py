@@ -370,15 +370,19 @@ def robust_send_telegram(token: str, chat_id: str | int, text: str) -> bool:
 
 def run_24_7_service():
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
-    if not token or not chat_id:
+    primary_chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+    if not token or not primary_chat_id:
         logger.error("Missing BOT_TOKEN or CHAT_ID in .env")
         return
+
+    # Track all active chat subscribers dynamically
+    subscribers = {str(primary_chat_id)}
 
     mgr = ProductionRuntimeManager()
     base_url = f"https://api.telegram.org/bot{token}"
     last_update_id = 0
     last_scan_time = 0
+    last_pulse_time = time.time()  # Track periodic telemetry pulse
 
     logger.info("==================================================")
     logger.info("   24/7 MASTER LIVE TRADER (6 UPGRADES ACTIVE)    ")
@@ -412,11 +416,14 @@ def run_24_7_service():
                         for upd in data.get("result", []):
                             last_update_id = upd["update_id"]
                             msg = upd.get("message", {})
-                            u_chat = msg.get("chat", {}).get("id")
+                            u_chat = str(msg.get("chat", {}).get("id"))
                             text = msg.get("text", "").strip().lower()
 
                             if not u_chat or not text:
                                 continue
+
+                            # Register this chat for continuous alerts
+                            subscribers.add(u_chat)
 
                             if text.startswith("/start"):
                                 mgr.set_alerts(True)
@@ -519,9 +526,29 @@ def run_24_7_service():
                                             break
 
                                 if not suppress_alert:
-                                    robust_send_telegram(token, chat_id, format_card(setup, "24/7 MASTER SIGNAL"))
+                                    card = format_card(setup, "24/7 MASTER SIGNAL")
+                                    for cid in list(subscribers):
+                                        robust_send_telegram(token, cid, card)
                                     mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time)
                                     logger.info("Dispatched 24/7 Master Alert for %s at %.2f (Confidence: %.1f%%)", setup["action"], setup["price"], setup["confidence"])
+
+                            # Continuous 30-Minute Telemetry Pulse (So you always know the bot is actively scanning)
+                            elif now - last_pulse_time >= 1800: # 30 mins
+                                last_pulse_time = now
+                                pulse_msg = (
+                                    f"📡 *24/7 MARKET TELEMETRY (Scanning Live)*\n"
+                                    f"━━━━━━━━━━━━━━━━━━━\n"
+                                    f"• *Gold Price*: `${current_close:.2f}`\n"
+                                    f"• *Session*: `{setup['session']}`\n"
+                                    f"• *Market Bias*: `HOLD / CONSOLIDATING`\n"
+                                    f"• *Volume Delta*: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n"
+                                    f"• *Verified Win Rate*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n\n"
+                                    f"🛡️ *Status*: Capital protected. Awaiting high-confluence liquidity sweep / breakout.\n"
+                                    f"Tap `/trade` for instant on-demand setup."
+                                )
+                                for cid in list(subscribers):
+                                    robust_send_telegram(token, cid, pulse_msg)
+                                logger.info("Dispatched 30-minute market pulse to Telegram.")
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)
