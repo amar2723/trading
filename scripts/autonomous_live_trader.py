@@ -458,6 +458,39 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
     )
 
 
+def format_telemetry_pulse(setup: dict, broker: OctaBrokerAdapter, mgr: ProductionRuntimeManager) -> str:
+    active_pos = list(broker.open_positions.values())
+    if active_pos:
+        pos = active_pos[0]
+        cur_p = setup["price"]
+        pips = (cur_p - pos.open_price) * 10 if pos.side == "BUY" else (pos.open_price - cur_p) * 10
+        pos_str = f"⚡ *ACTIVE {pos.side}*: `{pos.lots} lots @ ${pos.open_price:.2f}` ({pips:+.1f} pips | TP: ${pos.tp1:.2f} | SL: ${pos.sl:.2f})"
+    else:
+        pos_str = "🛡️ *POSITION*: Flat (0 Exposure - Capital Preserved)"
+
+    pred_dir = setup.get("action", "HOLD")
+    strategy = setup.get("strategy", "H1_TREND_PULLBACK")
+    ml_dec = setup.get("ml_decision", "ABSTAIN")
+    exp_r = setup.get("ml_expected_R", 0.0)
+    win_p = setup.get("ml_win_prob", 0.45) * 100
+
+    bias_icon = "🟢" if pred_dir == "BUY" else ("🔴" if pred_dir == "SELL" else "⏸️")
+
+    return (
+        f"🛰️ *XAUUSD LIVE TELEMETRY (30s PULSE)*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 *Live Gold*: `${setup['price']:.2f}`\n"
+        f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n"
+        f"{bias_icon} *AI Model Bias*: `{pred_dir}` via `{strategy}`\n"
+        f"🧠 *ML Filter*: `{ml_dec}` (Prob: `{win_p:.1f}%`, E[R]: `{exp_r:+.2f}R`)\n"
+        f"🌊 *Order Flow*: 🟢 `{setup['buyer_pct']}%` vs 🔴 `{setup['seller_pct']}%` | RSI: `{setup.get('rsi', 50.0)}`\n"
+        f"{pos_str}\n"
+        f"📈 *Verified Accuracy*: `{mgr.state.get('win_rate_pct', 0.0)}%` ({mgr.state.get('wins', 0)}W / {mgr.state.get('losses', 0)}L)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 Commands: `/trade` (Instant setup) | `/end` (Pause alerts)"
+    )
+
+
 def robust_send_telegram(token: str, chat_id: str | int, text: str) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     for attempt in range(3):
@@ -735,6 +768,13 @@ def run_24_7_service():
 
                             mgr.state["last_alerted_candle"] = candle_bar_time
                             mgr.save_state()
+
+                        # 3. Continuous ~30s Telemetry Pulse (Sends ~2 notifications per minute so user sees real-time AI tracking)
+                        if not (should_alert and is_actionable):
+                            pulse_card = format_telemetry_pulse(setup, broker, mgr)
+                            for cid in list(subscribers):
+                                robust_send_telegram(token, cid, pulse_card)
+                            logger.info("Dispatched 30s live telemetry pulse to %d subscriber(s) (Gold: $%.2f, Bias: %s)", len(subscribers), setup["price"], setup["action"])
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)
