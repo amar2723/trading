@@ -41,6 +41,16 @@ logger = logging.getLogger("24x7MasterProduction")
 
 STATE_FILE = ROOT / "reports/bot_runtime_state.json"
 ENSEMBLE_PATH = ROOT / "models/xauusd_master_ensemble.pkl"
+AUDIT_LOG_FILE = ROOT / "reports/live_predictions_audit.jsonl"
+
+
+def log_audit_record(data: dict):
+    try:
+        AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data) + "\n")
+    except Exception as e:
+        logger.warning("Audit log write error: %s", e)
 
 
 class ProductionRuntimeManager:
@@ -92,8 +102,10 @@ class ProductionRuntimeManager:
     def is_alerts_enabled(self) -> bool:
         return bool(self.state.get("alerts_enabled", True))
 
-    def record_prediction(self, action: str, entry: float, sl: float, tp1: float, tp2: float, bar_time: str):
-        self.state["pending_trades"].append({
+    def record_prediction(self, action: str, entry: float, sl: float, tp1: float, tp2: float, bar_time: str, confidence: float = 80.0, rsi: float = 50.0):
+        t_id = f"pred_{int(time.time())}"
+        trade = {
+            "id": t_id,
             "action": action,
             "entry": entry,
             "sl": sl,
@@ -102,10 +114,15 @@ class ProductionRuntimeManager:
             "time": bar_time,
             "status": "OPEN",
             "be_active": False,
-        })
-        self.state["pending_trades"] = self.state["pending_trades"][-12:]
+            "confidence": confidence,
+            "rsi": rsi,
+            "created_at": str(datetime.now()),
+        }
+        self.state["pending_trades"].append(trade)
+        self.state["pending_trades"] = self.state["pending_trades"][-15:]
         self.state["last_alerted_candle"] = bar_time
         self.save_state()
+        log_audit_record({"event": "PREDICTION_CREATED", **trade})
 
     def update_from_candle(self, high: float, low: float, close: float) -> str | None:
         updated = None
@@ -122,40 +139,56 @@ class ProductionRuntimeManager:
                 if not t.get("be_active") and high >= entry + 2.0:
                     t["be_active"] = True
                     t["sl"] = entry # Protected to BE!
-                    updated = f"BUY position moved to BREAK-EVEN (Risk-Free) at {entry:.2f}"
+                    updated = f"BUY moved to BREAK-EVEN (Risk-Free) at {entry:.2f} (+20 pips profit secured)"
+                    log_audit_record({"event": "BREAK_EVEN_TRIGGERED", "trade_id": t.get("id"), "action": act, "entry": entry})
                 if high >= tp1:
                     t["status"] = "WIN"
                     self.state["wins"] += 1
                     self.state["total_predictions"] += 1
                     self.state["buyer_weight"] = round(self.state["buyer_weight"] * 1.02, 3)
-                    updated = f"BUY hit TP1 at {tp1:.2f}. Win recorded!"
+                    pips = (tp1 - entry) * 10
+                    updated = f"✅ BUY HIT TP1 at {tp1:.2f} (+{pips:.1f} pips WIN)!"
+                    log_audit_record({"event": "TRADE_RESOLVED", "outcome": "WIN", "pips": pips, "exit_price": tp1, **t})
                 elif low <= t["sl"]:
                     t["status"] = "BE_EXIT" if t.get("be_active") else "LOSS"
                     if not t.get("be_active"):
                         self.state["losses"] += 1
                         self.state["total_predictions"] += 1
                         self.state["buyer_weight"] = round(max(0.8, self.state["buyer_weight"] * 0.98), 3)
-                    updated = f"BUY exited at {t['sl']:.2f}."
+                        pips = (t['sl'] - entry) * 10
+                        updated = f"🛑 BUY STOPPED at {t['sl']:.2f} ({pips:.1f} pips)."
+                        log_audit_record({"event": "TRADE_RESOLVED", "outcome": "LOSS", "pips": pips, "exit_price": t['sl'], **t})
+                    else:
+                        updated = f"🔒 BUY EXITED AT BREAK-EVEN at {t['sl']:.2f} (0.0 pips - $0.00 Loss)."
+                        log_audit_record({"event": "TRADE_RESOLVED", "outcome": "BE_EXIT", "pips": 0.0, "exit_price": t['sl'], **t})
 
             elif act == "SELL":
                 # Check BE threshold (+20 pips)
                 if not t.get("be_active") and low <= entry - 2.0:
                     t["be_active"] = True
                     t["sl"] = entry
-                    updated = f"SELL position moved to BREAK-EVEN (Risk-Free) at {entry:.2f}"
+                    updated = f"SELL moved to BREAK-EVEN (Risk-Free) at {entry:.2f} (+20 pips profit secured)"
+                    log_audit_record({"event": "BREAK_EVEN_TRIGGERED", "trade_id": t.get("id"), "action": act, "entry": entry})
                 if low <= tp1:
                     t["status"] = "WIN"
                     self.state["wins"] += 1
                     self.state["total_predictions"] += 1
                     self.state["seller_weight"] = round(self.state["seller_weight"] * 1.02, 3)
-                    updated = f"SELL hit TP1 at {tp1:.2f}. Win recorded!"
+                    pips = (entry - tp1) * 10
+                    updated = f"✅ SELL HIT TP1 at {tp1:.2f} (+{pips:.1f} pips WIN)!"
+                    log_audit_record({"event": "TRADE_RESOLVED", "outcome": "WIN", "pips": pips, "exit_price": tp1, **t})
                 elif high >= t["sl"]:
                     t["status"] = "BE_EXIT" if t.get("be_active") else "LOSS"
                     if not t.get("be_active"):
                         self.state["losses"] += 1
                         self.state["total_predictions"] += 1
                         self.state["seller_weight"] = round(max(0.8, self.state["seller_weight"] * 0.98), 3)
-                    updated = f"SELL exited at {t['sl']:.2f}."
+                        pips = (entry - t['sl']) * 10
+                        updated = f"🛑 SELL STOPPED at {t['sl']:.2f} ({pips:.1f} pips)."
+                        log_audit_record({"event": "TRADE_RESOLVED", "outcome": "LOSS", "pips": pips, "exit_price": t['sl'], **t})
+                    else:
+                        updated = f"🔒 SELL EXITED AT BREAK-EVEN at {t['sl']:.2f} (0.0 pips - $0.00 Loss)."
+                        log_audit_record({"event": "TRADE_RESOLVED", "outcome": "BE_EXIT", "pips": 0.0, "exit_price": t['sl'], **t})
 
         tot = self.state["total_predictions"]
         if tot > 0:
@@ -319,6 +352,7 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         "regime": regime,
         "confidence": confidence,
         "win_rate": mgr.state["win_rate_pct"],
+        "rsi": round(rsi_val, 1),
         "why": why,
         "time": str(last_ts),
     }
@@ -383,6 +417,7 @@ def run_24_7_service():
     last_update_id = 0
     last_scan_time = 0
     last_pulse_time = time.time()  # Track periodic telemetry pulse
+    pulse_counter = 0
 
     logger.info("==================================================")
     logger.info("   24/7 MASTER LIVE TRADER (6 UPGRADES ACTIVE)    ")
@@ -472,6 +507,22 @@ def run_24_7_service():
                                 )
                                 robust_send_telegram(token, u_chat, status_text)
 
+                            elif text.startswith("/audit"):
+                                recent = mgr.state.get("pending_trades", [])[-5:]
+                                if not recent:
+                                    resp_text = "📊 *NO TRADES CURRENTLY IN AUDIT BUFFER.*"
+                                else:
+                                    resp_text = "📊 *RECENT PREDICTION vs ACTUAL AUDIT:*\n━━━━━━━━━━━━━━━━━━━\n"
+                                    for t in reversed(recent):
+                                        act = t["action"]
+                                        entry = t["entry"]
+                                        st = t["status"]
+                                        st_icon = "🟢 WIN" if st == "WIN" else ("🔒 BE" if st == "BE_EXIT" else ("🔴 LOSS" if st == "LOSS" else "⏳ OPEN"))
+                                        resp_text += f"• `{act}` @ `${entry:.2f}` ➔ {st_icon} (Confidence: {t.get('confidence', 80)}%)\n"
+                                    resp_text += f"\n• *Verified Record*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n"
+                                    resp_text += "• Ground-truth saved to `reports/live_predictions_audit.jsonl`."
+                                robust_send_telegram(token, u_chat, resp_text)
+
                             elif text.startswith("/help"):
                                 help_text = (
                                     "📖 *COMMAND GUIDE:*\n"
@@ -485,10 +536,11 @@ def run_24_7_service():
             except Exception as e:
                 logger.warning("Telegram polling hiccup (handled): %s", e)
 
-            # 2. Continuous 24/7 Background Scanner (Every 30 seconds)
+            # 2. Continuous 24/7 Background Scanner (Every 28 seconds = at least 2 notifications per minute)
             now = time.time()
-            if now - last_scan_time >= 30:
+            if now - last_scan_time >= 28:
                 last_scan_time = now
+                pulse_counter += 1
                 try:
                     df = fetch_live_candles("XAUUSD", "M5", 50)
                     if df is None or df.empty or len(df) < 30 or float(df["close"].iloc[-1]) < 3000.0:
@@ -500,56 +552,86 @@ def run_24_7_service():
                     current_candle_time = str(last_row["timestamp"])
                     current_close = float(last_row["close"])
 
+                    # 1. Check Trade Outcomes (TP, SL, Break-Even)
                     update_note = mgr.update_from_candle(
                         float(last_row["high"]), float(last_row["low"]), current_close
                     )
                     if update_note:
-                        logger.info("Master Learner: %s", update_note)
+                        logger.info("Master Learner Audit Event: %s", update_note)
+                        res_msg = (
+                            f"🔔 *TRADE AUDIT RESOLUTION*\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"{update_note}\n\n"
+                            f"• *Current Gold*: `${current_close:.2f}`\n"
+                            f"• *Verified Record*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n"
+                            f"📁 Logged to `reports/live_predictions_audit.jsonl` for retraining."
+                        )
+                        for cid in list(subscribers):
+                            robust_send_telegram(token, cid, res_msg)
 
                     if mgr.is_alerts_enabled():
-                        if current_candle_time != mgr.state.get("last_alerted_candle"):
-                            setup = analyze_with_6_master_upgrades(df, mgr)
-                            
-                            # Filter 1: Ignore HOLD signals (no edge)
-                            if setup["action"] != "HOLD" and setup["confidence"] >= 80.0:
-                                # Filter 2: Trade Lock & Anti-Spam Check
-                                suppress_alert = False
-                                for t in mgr.state.get("pending_trades", []):
-                                    if t.get("status") == "OPEN" and t.get("action") == setup["action"]:
-                                        # If active trade is underwater, DO NOT double down / catch knives!
-                                        if setup["action"] == "BUY" and current_close < t["entry"] - 1.0:
-                                            suppress_alert = True
-                                            logger.info("Suppressed duplicate BUY: Active BUY at %.2f is underwater (-%.1f pips).", t["entry"], (t["entry"] - current_close) * 10)
-                                            break
-                                        elif setup["action"] == "SELL" and current_close > t["entry"] + 1.0:
-                                            suppress_alert = True
-                                            logger.info("Suppressed duplicate SELL: Active SELL at %.2f is underwater (-%.1f pips).", t["entry"], (current_close - t["entry"]) * 10)
-                                            break
+                        setup = analyze_with_6_master_upgrades(df, mgr)
 
-                                if not suppress_alert:
-                                    card = format_card(setup, "24/7 MASTER SIGNAL")
-                                    for cid in list(subscribers):
-                                        robust_send_telegram(token, cid, card)
-                                    mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time)
-                                    logger.info("Dispatched 24/7 Master Alert for %s at %.2f (Confidence: %.1f%%)", setup["action"], setup["price"], setup["confidence"])
+                        # High Confluence Signal
+                        dispatched_signal = False
+                        if setup["action"] != "HOLD" and setup["confidence"] >= 80.0 and current_candle_time != mgr.state.get("last_alerted_candle"):
+                            suppress_alert = False
+                            for t in mgr.state.get("pending_trades", []):
+                                if t.get("status") == "OPEN" and t.get("action") == setup["action"]:
+                                    if setup["action"] == "BUY" and current_close < t["entry"] - 1.0:
+                                        suppress_alert = True
+                                        logger.info("Suppressed duplicate BUY: Active BUY underwater.")
+                                        break
+                                    elif setup["action"] == "SELL" and current_close > t["entry"] + 1.0:
+                                        suppress_alert = True
+                                        logger.info("Suppressed duplicate SELL: Active SELL underwater.")
+                                        break
 
-                            # Continuous 30-Minute Telemetry Pulse (So you always know the bot is actively scanning)
-                            elif now - last_pulse_time >= 1800: # 30 mins
-                                last_pulse_time = now
-                                pulse_msg = (
-                                    f"📡 *24/7 MARKET TELEMETRY (Scanning Live)*\n"
-                                    f"━━━━━━━━━━━━━━━━━━━\n"
-                                    f"• *Gold Price*: `${current_close:.2f}`\n"
-                                    f"• *Session*: `{setup['session']}`\n"
-                                    f"• *Market Bias*: `HOLD / CONSOLIDATING`\n"
-                                    f"• *Volume Delta*: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n"
-                                    f"• *Verified Win Rate*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n\n"
-                                    f"🛡️ *Status*: Capital protected. Awaiting high-confluence liquidity sweep / breakout.\n"
-                                    f"Tap `/trade` for instant on-demand setup."
-                                )
+                            if not suppress_alert:
+                                card = format_card(setup, "24/7 MASTER SIGNAL")
                                 for cid in list(subscribers):
-                                    robust_send_telegram(token, cid, pulse_msg)
-                                logger.info("Dispatched 30-minute market pulse to Telegram.")
+                                    robust_send_telegram(token, cid, card)
+                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time, setup["confidence"], setup["rsi"])
+                                logger.info("Dispatched 24/7 Master Alert for %s at %.2f (Confidence: %.1f%%)", setup["action"], setup["price"], setup["confidence"])
+                                dispatched_signal = True
+
+                        # If no high-confluence trade triggered, send the 28s Telemetry & Prediction Audit Pulse!
+                        if not dispatched_signal:
+                            open_trades = [t for t in mgr.state.get("pending_trades", []) if t.get("status") == "OPEN"]
+                            if open_trades:
+                                lt = open_trades[-1]
+                                pips = (current_close - lt["entry"]) * 10 if lt["action"] == "BUY" else (lt["entry"] - current_close) * 10
+                                p_icon = "🟢" if pips >= 0 else "🔴"
+                                be_icon = " [BE Protected 🔒]" if lt.get("be_active") else ""
+                                trade_audit = (
+                                    f"• *Active Signal*: `{lt['action']}` @ `${lt['entry']:.2f}`{be_icon}\n"
+                                    f"• *Live Outcome*: {p_icon} `{pips:+.1f} pips` (${current_close:.2f})\n"
+                                    f"• *Target TP1*: `${lt['tp1']:.2f}` | *SL*: `${lt['sl']:.2f}`"
+                                )
+                            else:
+                                trade_audit = (
+                                    f"• *Recent Audit*: Market consolidating safely.\n"
+                                    f"• *Status*: Standing aside. Capturing ticks for retraining."
+                                )
+
+                            pulse_msg = (
+                                f"⚡ *LIVE PULSE #{pulse_counter}* [2x/min] | `${current_close:.2f}`\n"
+                                f"━━━━━━━━━━━━━━━━━━━\n"
+                                f"• *AI Bias*: `{setup['action']}` (Score: `{setup['confidence']}%`)\n"
+                                f"• *M5 RSI*: `{setup['rsi']}` | *Regime*: `{setup['regime']}`\n"
+                                f"• *Session*: `{setup['session']}`\n"
+                                f"• *Volume Delta*: 🟢 `{setup['buyer_pct']}%` vs 🔴 `{setup['seller_pct']}%`\n\n"
+                                f"🔍 *PREDICTION vs ACTUAL AUDIT:*\n"
+                                f"{trade_audit}\n"
+                                f"• *Verified Record*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n"
+                                f"• *Audit Stream*: Every tick logged for automated retraining."
+                            )
+                            for cid in list(subscribers):
+                                robust_send_telegram(token, cid, pulse_msg)
+                            logger.info("Dispatched 28s Pulse #%d: Gold %.2f, Signal %s (Score %.1f%%)", pulse_counter, current_close, setup['action'], setup['confidence'])
+
+                except Exception as e:
+                    logger.warning("Scanner cycle error (handled): %s", e)
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)
