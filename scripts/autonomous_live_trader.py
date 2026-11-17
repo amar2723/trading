@@ -307,11 +307,17 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             logger.warning("Ensemble note: %s", e)
 
     # High-Accuracy Confluence Direction Engine (Accurate Setup Formulation)
-    risk_dist = round(max(atr_val * 1.25, 3.20), 2)  # Tight 32-45 pip risk buffer
+    risk_dist = round(max(atr_val * 1.5, 4.50), 2)  # Hardened 45-60 pip risk buffer
 
     # Multi-factor score
     long_score = 0
     short_score = 0
+
+    # Macro H1 Trend Bias is dominant (4 points)
+    if h1_trend_bias == 1:
+        long_score += 4
+    elif h1_trend_bias == -1:
+        short_score += 4
 
     if current_price > ema_20:
         long_score += 2
@@ -339,11 +345,17 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     if rsi_val <= 30.0:
         short_score -= 4
 
-    if long_score >= short_score:
+    if long_score > short_score:
         action = "BUY"
+    elif short_score > long_score:
+        action = "SELL"
+    else:
+        action = "BUY" if h1_trend_bias == 1 else "SELL"
+
+    if action == "BUY":
         entry = round(current_price, 2)
         sl = round(entry - risk_dist, 2)
-        risk = max(entry - sl, 2.50)
+        risk = max(entry - sl, 3.50)
         tp1 = round(entry + (risk * 1.5), 2)
         tp2 = round(entry + (risk * 2.8), 2)
         be_trigger = round(entry + 2.00, 2)
@@ -356,10 +368,9 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
         )
     else:
-        action = "SELL"
         entry = round(current_price, 2)
         sl = round(entry + risk_dist, 2)
-        risk = max(sl - entry, 2.50)
+        risk = max(sl - entry, 3.50)
         tp1 = round(entry - (risk * 1.5), 2)
         tp2 = round(entry - (risk * 2.8), 2)
         be_trigger = round(entry - 2.00, 2)
@@ -385,15 +396,16 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     elif sig_squeeze.action != "HOLD":
         active_strategy = sig_squeeze.strategy_name
 
-    # Phase 2 ML Meta-Filter Expected R Evaluation
-    ml_verdict = meta_filter.evaluate_candidate(action, df, h1_trend_bias, h1_dist_ema50)
+    # Phase 2 ML Meta-Filter Expected R Evaluation (Strict +0.15R Hurdle)
+    ml_verdict = meta_filter.evaluate_candidate(action, df, h1_trend_bias, h1_dist_ema50, min_expected_R=0.15)
 
-    # Phase 2 Risk Governor Review
+    # Phase 2 Risk Governor Review (with Asian Session Chop Shield)
     risk_approval = risk_governor.review_trade(
         equity=broker.equity,
         risk_pips=risk_dist * 10,
         current_spread_pips=24.0,
         open_positions_count=len(broker.open_positions),
+        session_hour=curr_hour,
     )
 
     return {
@@ -652,7 +664,8 @@ def run_24_7_service():
                         continue
 
                     last_row = df.iloc[-1]
-                    current_candle_time = str(last_row["timestamp"])
+                    # Canonical 5-minute bar time (floored to clean 5min boundary)
+                    candle_bar_time = pd.to_datetime(last_row["timestamp"]).floor("5min").strftime("%Y-%m-%d %H:%M:00")
                     current_close = float(last_row["close"])
 
                     # 1. Evaluate Octa Broker Tick Events (Fills, BE, TP, SL)
@@ -670,7 +683,7 @@ def run_24_7_service():
                                 exit_price=current_close,
                                 pnl_pips=0.0,
                                 pnl_R=0.0,
-                                exit_timestamp=str(last_row["timestamp"]),
+                                exit_timestamp=candle_bar_time,
                             )
 
                     # 2. Check Legacy Prediction Outcomes (TP, SL, Break-Even)
@@ -693,45 +706,36 @@ def run_24_7_service():
                     if mgr.is_alerts_enabled():
                         setup = analyze_with_6_master_upgrades(df, mgr)
 
-                        # Dispatch Master Trade Card on candle close or significant shift
-                        should_alert = current_candle_time != mgr.state.get("last_alerted_candle")
-                        if should_alert and setup["confidence"] >= 75.0:
-                            suppress_alert = False
-                            for t in mgr.state.get("pending_trades", []):
-                                if t.get("status") == "OPEN" and t.get("action") == setup["action"]:
-                                    if setup["action"] == "BUY" and current_close < t["entry"] - 1.5:
-                                        suppress_alert = True
-                                        logger.info("Suppressed duplicate BUY: Active BUY underwater.")
-                                        break
-                                    elif setup["action"] == "SELL" and current_close > t["entry"] + 1.5:
-                                        suppress_alert = True
-                                        logger.info("Suppressed duplicate SELL: Active SELL underwater.")
-                                        break
+                        # Strictly trigger at most ONCE per closed 5-minute candle
+                        should_alert = candle_bar_time != mgr.state.get("last_alerted_candle")
+                        if should_alert:
+                            # 1. Always log decision to immutable Signal Journal for complete audit trail
+                            sig_id = signal_journal.log_signal_decision(
+                                strategy_name=setup.get("strategy", "H1_TREND_PULLBACK"),
+                                action=setup["action"],
+                                entry=setup["entry"],
+                                sl=setup["sl"],
+                                tp1=setup["tp1"],
+                                tp2=setup["tp2"],
+                                risk_pips=setup.get("risk_pips", 45.0),
+                                predicted_win_prob=setup.get("ml_win_prob", 0.45),
+                                expected_R=setup.get("ml_expected_R", 0.10),
+                                ml_decision=setup.get("ml_decision", "TAKE"),
+                                risk_approved=setup.get("risk_approved", True),
+                                risk_lot_size=setup.get("lot_size", 0.01),
+                                risk_usd=setup.get("risk_usd", 0.50),
+                                veto_reason=setup.get("risk_veto"),
+                                bar_timestamp=candle_bar_time,
+                            )
 
-                            if not suppress_alert:
-                                sig_id = signal_journal.log_signal_decision(
-                                    strategy_name=setup.get("strategy", "H1_TREND_PULLBACK"),
-                                    action=setup["action"],
-                                    entry=setup["entry"],
-                                    sl=setup["sl"],
-                                    tp1=setup["tp1"],
-                                    tp2=setup["tp2"],
-                                    risk_pips=setup.get("risk_pips", 35.0),
-                                    predicted_win_prob=setup.get("ml_win_prob", 0.45),
-                                    expected_R=setup.get("ml_expected_R", 0.10),
-                                    ml_decision=setup.get("ml_decision", "TAKE"),
-                                    risk_approved=setup.get("risk_approved", True),
-                                    risk_lot_size=setup.get("lot_size", 0.01),
-                                    risk_usd=setup.get("risk_usd", 0.50),
-                                    veto_reason=setup.get("risk_veto"),
-                                    bar_timestamp=setup["time"],
-                                )
+                            # 2. Gating: ONLY dispatch to Telegram & broker execute if BOTH ML filter and Risk Governor approve!
+                            is_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE"
+                            if is_actionable:
                                 card = format_card(setup, "24/7 MASTER AI SIGNAL")
                                 for cid in list(subscribers):
                                     robust_send_telegram(token, cid, card)
-                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time, setup["confidence"], setup["rsi"])
-                                executed_pos = None
-                                if setup.get("risk_approved") and len(broker.open_positions) == 0:
+                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], candle_bar_time, setup["confidence"], setup["rsi"])
+                                if len(broker.open_positions) == 0:
                                     executed_pos = broker.execute_order(
                                         side=setup["action"],
                                         lots=setup.get("lot_size", 0.01),
@@ -742,7 +746,13 @@ def run_24_7_service():
                                     )
                                     if executed_pos:
                                         logger.info("Octa Shadow Demo executed order %s (%s %.2f lots @ %.2f)", executed_pos.ticket, setup["action"], executed_pos.lots, executed_pos.open_price)
-                                logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%)", setup["action"], sig_id, setup["price"], setup["confidence"])
+                                logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%, E[R]: +%.2fR)", setup["action"], sig_id, setup["price"], setup["confidence"], setup.get("ml_expected_R", 0.0))
+                            else:
+                                veto_reason = setup.get("risk_veto") or f"ML E[R] ({setup.get('ml_expected_R', 0.0):+.2f}R) below hurdle (+0.15R)"
+                                logger.info("Bar %s Filtered: ML=%s, Risk=%s. [Decision: HOLD]", candle_bar_time, setup.get("ml_decision"), veto_reason)
+
+                            mgr.state["last_alerted_candle"] = candle_bar_time
+                            mgr.save_state()
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)

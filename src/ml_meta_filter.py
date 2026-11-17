@@ -45,7 +45,7 @@ class MLMetaFilter:
         df_m5: pd.DataFrame,
         h1_trend_bias: int = 1,
         h1_dist_ema50: float = 0.0,
-        min_expected_R: float = 0.05,
+        min_expected_R: float = 0.15,
     ) -> FilterDecision:
         if candidate_action == "HOLD" or self.ensemble is None:
             return FilterDecision(
