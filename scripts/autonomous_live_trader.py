@@ -31,6 +31,15 @@ if str(ROOT) not in sys.path:
 load_dotenv(ROOT / ".env")
 
 from src.live_data import fetch_live_candles
+from src.strategies.benchmark_strategies import (
+    H1TrendM5PullbackStrategy,
+    DonchianBreakoutStrategy,
+    VolatilitySqueezeStrategy,
+    CandidateSignal,
+)
+from src.ml_meta_filter import MLMetaFilter
+from src.risk_governor import RiskGovernor
+from src.signal_journal import SignalJournal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +51,11 @@ logger = logging.getLogger("24x7MasterProduction")
 STATE_FILE = ROOT / "reports/bot_runtime_state.json"
 ENSEMBLE_PATH = ROOT / "models/xauusd_master_ensemble.pkl"
 AUDIT_LOG_FILE = ROOT / "reports/live_predictions_audit.jsonl"
+
+# Global Phase 2 Engines
+meta_filter = MLMetaFilter()
+risk_governor = RiskGovernor(max_risk_pct=1.0, max_spread_pips=35.0)
+signal_journal = SignalJournal()
 
 
 def log_audit_record(data: dict):
@@ -356,16 +370,48 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
         )
 
+    # Phase 2 Strategy Layer Evaluation
+    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df, df_h1 if 'df_h1' in locals() and df_h1 is not None else None)
+    sig_donchian = DonchianBreakoutStrategy.evaluate(df)
+    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df)
+
+    active_strategy = "H1_TREND_PULLBACK"
+    if sig_pullback.action != "HOLD":
+        active_strategy = sig_pullback.strategy_name
+    elif sig_donchian.action != "HOLD":
+        active_strategy = sig_donchian.strategy_name
+    elif sig_squeeze.action != "HOLD":
+        active_strategy = sig_squeeze.strategy_name
+
+    # Phase 2 ML Meta-Filter Expected R Evaluation
+    ml_verdict = meta_filter.evaluate_candidate(action, df, h1_trend_bias, h1_dist_ema50)
+
+    # Phase 2 Risk Governor Review
+    risk_approval = risk_governor.review_trade(
+        equity=40.68,
+        risk_pips=risk_dist * 10,
+        current_spread_pips=20.0,
+        open_positions_count=len([t for t in mgr.state.get("pending_trades", []) if t.get("status") == "OPEN"]),
+    )
+
     return {
         "price": current_price,
         "action": action,
+        "strategy": active_strategy,
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "be_trigger": be_trigger,
-        "risk_reward": "1 : 2.5",
-        "lot_size": 0.01,
+        "risk_reward": "1 : 1.5",
+        "lot_size": risk_approval.lot_size,
+        "risk_usd": risk_approval.risk_usd,
+        "risk_pips": risk_dist * 10,
+        "ml_decision": ml_verdict.decision,
+        "ml_expected_R": ml_verdict.expected_R,
+        "ml_win_prob": ml_verdict.predicted_win_prob,
+        "risk_approved": risk_approval.approved,
+        "risk_veto": risk_approval.veto_reason,
         "buyer_pct": buyer_pct,
         "seller_pct": seller_pct,
         "session": session_name,
@@ -382,6 +428,10 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
 
 def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str:
     icon = "🔴" if setup["action"] == "SELL" else "🟢"
+    lot_disp = setup.get("lot_size", 0.01) if setup.get("lot_size", 0.0) > 0 else 0.01
+    risk_usd_disp = setup.get("risk_usd", 0.50) if setup.get("risk_usd", 0.0) > 0 else 0.50
+    risk_status_disp = "🟢 APPROVED" if setup.get("risk_approved") else f"⚠️ PAUSED ({setup.get('risk_veto')})"
+
     return (
         f"{icon} *{title_prefix} ({setup['action']})*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -394,14 +444,17 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"🏁 *TAKE PROFIT 1 (TP1)*: `${setup['tp1']:.2f}` (Close 50% Lot)\n"
         f"🚀 *TAKE PROFIT 2 (TP2)*: `${setup['tp2']:.2f}` (Full Target Runner)\n\n"
         f"⚖️ *Risk / Reward*: `{setup['risk_reward']}`\n"
-        f"💰 *Recommended Volume*: `{setup['lot_size']} Lots`\n"
-        f"🔥 *Win Confidence*: `{setup['confidence']}%`\n"
-        f"🧠 *Broker Audited Win Rate*: `{setup['win_rate']}%` ({setup.get('win_count', 0)}W / {setup.get('loss_count', 0)}L)\n"
+        f"💰 *Recommended Volume*: `{lot_disp} Lots` (Risk: `${risk_usd_disp:.2f}`)\n"
+        f"🛡️ *Strategy Engine*: `{setup.get('strategy', 'H1_TREND_PULLBACK')}`\n"
+        f"🧠 *ML Meta-Filter*: `{setup.get('ml_decision', 'TAKE')}` (E[R]: `{setup.get('ml_expected_R', 0.10):+.2f}R`, Prob: `{setup.get('ml_win_prob', 0.45)*100:.1f}%`)\n"
+        f"🚦 *Risk Governor*: {risk_status_disp}\n"
+        f"📈 *Broker Audited Win Rate*: `{setup['win_rate']}%` ({setup.get('win_count', 0)}W / {setup.get('loss_count', 0)}L)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *6-PILLAR INSTITUTIONAL ANALYSIS*:\n"
         f"{setup['why']}\n"
         f"• *Signed Volume Proxy*: 🟢 {setup['buyer_pct']}% Buyers vs 🔴 {setup['seller_pct']}% Sellers\n"
         f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,685 M5 Bars)\n"
+        f"• *Signal Journal*: Logged to `reports/signal_journal.jsonl`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💡 *Commands*: `/trade` | `/end` (Pause) | `/start` (Resume) | `/status`"
     )
@@ -610,11 +663,28 @@ def run_24_7_service():
                                         break
 
                             if not suppress_alert:
+                                sig_id = signal_journal.log_signal_decision(
+                                    strategy_name=setup.get("strategy", "H1_TREND_PULLBACK"),
+                                    action=setup["action"],
+                                    entry=setup["entry"],
+                                    sl=setup["sl"],
+                                    tp1=setup["tp1"],
+                                    tp2=setup["tp2"],
+                                    risk_pips=setup.get("risk_pips", 35.0),
+                                    predicted_win_prob=setup.get("ml_win_prob", 0.45),
+                                    expected_R=setup.get("ml_expected_R", 0.10),
+                                    ml_decision=setup.get("ml_decision", "TAKE"),
+                                    risk_approved=setup.get("risk_approved", True),
+                                    risk_lot_size=setup.get("lot_size", 0.01),
+                                    risk_usd=setup.get("risk_usd", 0.50),
+                                    veto_reason=setup.get("risk_veto"),
+                                    bar_timestamp=setup["time"],
+                                )
                                 card = format_card(setup, "24/7 MASTER AI SIGNAL")
                                 for cid in list(subscribers):
                                     robust_send_telegram(token, cid, card)
                                 mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time, setup["confidence"], setup["rsi"])
-                                logger.info("Dispatched 24/7 Master AI Signal Card for %s at %.2f (Confidence: %.1f%%)", setup["action"], setup["price"], setup["confidence"])
+                                logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%)", setup["action"], sig_id, setup["price"], setup["confidence"])
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)
