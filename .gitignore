@@ -10,6 +10,8 @@ reports/
 data/raw/*.csv
 data/processed/*.csv
 data/labels/*.csv
+data/labeled/*.csv
+scratch/
 models/*.pkl
 !models/xauusd_master_ensemble.pkl
 models/*.joblib

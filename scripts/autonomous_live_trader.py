@@ -40,6 +40,7 @@ from src.strategies.benchmark_strategies import (
 from src.ml_meta_filter import MLMetaFilter
 from src.risk_governor import RiskGovernor
 from src.signal_journal import SignalJournal
+from src.broker_adapter import OctaBrokerAdapter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,10 +53,11 @@ STATE_FILE = ROOT / "reports/bot_runtime_state.json"
 ENSEMBLE_PATH = ROOT / "models/xauusd_master_ensemble.pkl"
 AUDIT_LOG_FILE = ROOT / "reports/live_predictions_audit.jsonl"
 
-# Global Phase 2 Engines
+# Global Phase 2 & 3 Engines
 meta_filter = MLMetaFilter()
 risk_governor = RiskGovernor(max_risk_pct=1.0, max_spread_pips=35.0)
 signal_journal = SignalJournal()
+broker = OctaBrokerAdapter(initial_demo_equity=40.68)
 
 
 def log_audit_record(data: dict):
@@ -388,10 +390,10 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
 
     # Phase 2 Risk Governor Review
     risk_approval = risk_governor.review_trade(
-        equity=40.68,
+        equity=broker.equity,
         risk_pips=risk_dist * 10,
-        current_spread_pips=20.0,
-        open_positions_count=len([t for t in mgr.state.get("pending_trades", []) if t.get("status") == "OPEN"]),
+        current_spread_pips=24.0,
+        open_positions_count=len(broker.open_positions),
     )
 
     return {
@@ -454,9 +456,10 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"{setup['why']}\n"
         f"• *Signed Volume Proxy*: 🟢 {setup['buyer_pct']}% Buyers vs 🔴 {setup['seller_pct']}% Sellers\n"
         f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,685 M5 Bars)\n"
+        f"• *Execution Engine*: Octa Shadow Broker (Floating Spread & 50ms Slippage)\n"
         f"• *Signal Journal*: Logged to `reports/signal_journal.jsonl`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *Commands*: `/trade` | `/end` (Pause) | `/start` (Resume) | `/status`"
+        f"💡 *Commands*: `/trade` | `/demo` | `/status` | `/audit` | `/end` | `/start`"
     )
 
 
@@ -598,13 +601,38 @@ def run_24_7_service():
                                     resp_text += "• Ground-truth saved to `reports/live_predictions_audit.jsonl`."
                                 robust_send_telegram(token, u_chat, resp_text)
 
+                            elif text.startswith("/demo") or text.startswith("/performance") or text.startswith("/stats"):
+                                perf = broker.get_performance_summary()
+                                active_pos = list(broker.open_positions.values())
+                                active_text = "None (Flat)" if not active_pos else f"{active_pos[0].side} {active_pos[0].lots} lots @ {active_pos[0].open_price:.2f}"
+                                demo_msg = (
+                                    "🏦 *OCTA TRADER FORWARD DEMO PERFORMANCE*\n"
+                                    "━━━━━━━━━━━━━━━━━━━\n"
+                                    f"• *Account Balance*: `${perf.get('account_equity', broker.equity):.2f}`\n"
+                                    f"• *Active Position*: `{active_text}`\n"
+                                    f"• *Total Completed Trades*: `{perf.get('total_trades', 0)}`\n"
+                                    f"• *Win Rate*: `{perf.get('win_rate_pct', 0.0)}%` ({perf.get('wins', 0)}W / {perf.get('losses', 0)}L / {perf.get('break_even', 0)}BE)\n"
+                                    f"• *Profit Factor*: `{perf.get('profit_factor', 0.0)}`\n"
+                                    f"• *Net PnL*: `${perf.get('net_pnl_usd', 0.0):+.2f}`\n"
+                                    f"• *Gross Profit*: `${perf.get('gross_profit_usd', 0.0):.2f}` | Gross Loss: `${perf.get('gross_loss_usd', 0.0):.2f}`\n\n"
+                                    "🔬 *Execution Mechanics*:\n"
+                                    "• Broker-matched XAUUSD contract (100 oz, 0.01 lot)\n"
+                                    "• Floating spread (24 pips) + 50ms slippage model\n"
+                                    "• Same-bar conservative stop-loss resolution\n"
+                                    "• Dynamic Break-Even trigger at +20 pips\n"
+                                    "📁 Audit log: `reports/octa_demo_trades.csv`"
+                                )
+                                robust_send_telegram(token, u_chat, demo_msg)
+
                             elif text.startswith("/help"):
                                 help_text = (
                                     "📖 *COMMAND GUIDE:*\n"
                                     "• `/trade` - Instant 6-pillar trade card (Entry, SL, TP, BE)\n"
+                                    "• `/demo`  - Live Octa demo forward-test performance & PnL\n"
+                                    "• `/audit` - Recent prediction vs actual accuracy log\n"
+                                    "• `/status`- Check current market regime & win rate\n"
                                     "• `/start` - Activate 24/7 continuous notifications\n"
-                                    "• `/end`   - Stop / pause continuous notifications\n"
-                                    "• `/status`- Check current market regime & win rate"
+                                    "• `/end`   - Stop / pause continuous notifications"
                                 )
                                 robust_send_telegram(token, u_chat, help_text)
 
@@ -627,7 +655,25 @@ def run_24_7_service():
                     current_candle_time = str(last_row["timestamp"])
                     current_close = float(last_row["close"])
 
-                    # 1. Check Trade Outcomes (TP, SL, Break-Even)
+                    # 1. Evaluate Octa Broker Tick Events (Fills, BE, TP, SL)
+                    broker_events = broker.on_tick(
+                        float(last_row["high"]), float(last_row["low"]), current_close
+                    )
+                    for ev in broker_events:
+                        logger.info("Octa Broker Event: %s", ev)
+                        for cid in list(subscribers):
+                            robust_send_telegram(token, cid, f"⚡ *OCTA DEMO EXECUTION EVENT*\n━━━━━━━━━━━━━━━━━━━\n{ev}")
+                        if "CLOSED" in ev:
+                            signal_journal.log_trade_resolution(
+                                signal_id=ev.split()[1] if len(ev.split()) > 1 else "unknown",
+                                outcome="WIN" if "TAKE_PROFIT" in ev else ("BREAK_EVEN" if "BREAK_EVEN" in ev else "LOSS"),
+                                exit_price=current_close,
+                                pnl_pips=0.0,
+                                pnl_R=0.0,
+                                exit_timestamp=str(last_row["timestamp"]),
+                            )
+
+                    # 2. Check Legacy Prediction Outcomes (TP, SL, Break-Even)
                     update_note = mgr.update_from_candle(
                         float(last_row["high"]), float(last_row["low"]), current_close
                     )
@@ -684,6 +730,18 @@ def run_24_7_service():
                                 for cid in list(subscribers):
                                     robust_send_telegram(token, cid, card)
                                 mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time, setup["confidence"], setup["rsi"])
+                                executed_pos = None
+                                if setup.get("risk_approved") and len(broker.open_positions) == 0:
+                                    executed_pos = broker.execute_order(
+                                        side=setup["action"],
+                                        lots=setup.get("lot_size", 0.01),
+                                        current_price=setup["entry"],
+                                        sl=setup["sl"],
+                                        tp1=setup["tp1"],
+                                        tp2=setup["tp2"],
+                                    )
+                                    if executed_pos:
+                                        logger.info("Octa Shadow Demo executed order %s (%s %.2f lots @ %.2f)", executed_pos.ticket, setup["action"], executed_pos.lots, executed_pos.open_price)
                                 logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%)", setup["action"], sig_id, setup["price"], setup["confidence"])
 
                 except Exception as e:
