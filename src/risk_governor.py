@@ -81,13 +81,12 @@ class RiskGovernor:
         is_reconciled: bool = True,
         session_hour: int | None = None,
     ) -> RiskApproval:
-        # Check 0: Asian Session Chop Shield
+        # Check 0: Asian session chop shield (00:00 - 06:00 UTC)
         if session_hour is not None and 0 <= session_hour <= 6:
             return RiskApproval(
                 approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
-                veto_reason="VETO: Asian Session Chop Shield active (00:00-06:00 UTC). Empirical win rate < 20% in low-liquidity hours."
+                veto_reason=f"VETO: Asian session chop shield active (Hour {session_hour:02d}:00 UTC). Empirical win rate < 20% in low-liquidity hours."
             )
-
         # Check 1: Reconciliation integrity
         if not is_reconciled:
             return RiskApproval(

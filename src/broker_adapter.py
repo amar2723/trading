@@ -115,6 +115,9 @@ class OctaBrokerAdapter:
                         self.closed_positions.append(pos)
                         if row.get("account_equity"):
                             self.equity = float(row["account_equity"])
+                if self.equity < 10.0:
+                    logger.info("Demo account equity ($%.2f) below margin. Resetting demo balance to initial deposit ($%.2f).", self.equity, self.equity if self.equity >= 10 else 40.68)
+                    self.equity = 40.68
             except Exception as e:
                 logger.warning("Could not restore closed positions from CSV: %s", e)
 

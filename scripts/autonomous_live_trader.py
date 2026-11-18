@@ -378,7 +378,8 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     # Phase 2 Risk Governor Review (with Asian Session Chop Shield)
     risk_approval = risk_governor.review_trade(
         equity=broker.equity,
-        risk_pips=risk_dist * 10,
+        risk_pips=risk_dist * 10.0,
+        stop_dist_usd=risk_dist,
         current_spread_pips=24.0,
         open_positions_count=len(broker.open_positions),
         session_hour=curr_hour,

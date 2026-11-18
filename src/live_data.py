@@ -50,6 +50,9 @@ def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: 
         df = df.rename(columns={"volume": "tick_volume"})
         df["volume"] = df["tick_volume"]
         df["spread"] = 25.0
+        # If the latest candle is currently forming (non-zero seconds or unclosed), drop it so we only analyze completed closed bars
+        if len(df) > 1 and df["timestamp"].iloc[-1].second != 0:
+            df = df.iloc[:-1].reset_index(drop=True)
         return df.tail(bars).reset_index(drop=True)
 
 
