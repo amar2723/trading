@@ -66,10 +66,10 @@ class H1TrendM5PullbackStrategy:
         loss = (-diffs.clip(upper=0)).rolling(14).mean()
         rsi = float((100 - (100 / (1 + (gain / (loss + 1e-9))))).iloc[-1])
 
-        # ATR & Risk distance (minimum 4.50 pts / 45 pips)
+        # ATR & Risk distance (minimum 6.50 pts / 65 pips for noise resilience)
         tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
         atr = float(pd.Series(tr).rolling(14).mean().iloc[-1])
-        risk_dist = round(max(atr * 1.5, 4.50), 2)
+        risk_dist = round(max(atr * 1.8, 6.50), 2)
 
         # Bullish Pullback Setup:
         # 1. H1 Bull Trend confirmed
@@ -88,7 +88,7 @@ class H1TrendM5PullbackStrategy:
             sl = round(entry - risk_dist, 2)
             tp1 = round(entry + (risk_dist * 1.5), 2)
             tp2 = round(entry + (risk_dist * 2.8), 2)
-            be_trig = round(entry + 2.00, 2)
+            be_trig = round(entry + max(risk_dist * 0.85, 5.00), 2)
             return CandidateSignal(
                 strategy_name=cls.name,
                 action="BUY",
@@ -99,7 +99,7 @@ class H1TrendM5PullbackStrategy:
                 be_trigger=be_trig,
                 risk_reward="1 : 1.5",
                 risk_pips=risk_dist * 10,
-                confidence=85.0,
+                confidence=78.0,
                 rationale=f"H1 Bull Trend confirmed. Clean M5 Pullback into EMA 20/50 value zone with RSI {rsi:.1f} (Reloaded).",
                 bar_time=bar_time,
             )
@@ -121,7 +121,7 @@ class H1TrendM5PullbackStrategy:
             sl = round(entry + risk_dist, 2)
             tp1 = round(entry - (risk_dist * 1.5), 2)
             tp2 = round(entry - (risk_dist * 2.8), 2)
-            be_trig = round(entry - 2.00, 2)
+            be_trig = round(entry - max(risk_dist * 0.85, 5.00), 2)
             return CandidateSignal(
                 strategy_name=cls.name,
                 action="SELL",
@@ -132,7 +132,7 @@ class H1TrendM5PullbackStrategy:
                 be_trigger=be_trig,
                 risk_reward="1 : 1.5",
                 risk_pips=risk_dist * 10,
-                confidence=85.0,
+                confidence=78.0,
                 rationale=f"H1 Bear Trend confirmed. Clean M5 Pullback up into EMA 20/50 resistance with RSI {rsi:.1f} (Healthy).",
                 bar_time=bar_time,
             )
@@ -181,30 +181,32 @@ class DonchianBreakoutStrategy:
 
         tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
         atr = float(pd.Series(tr).rolling(14).mean().iloc[-1])
-        risk_dist = round(max(atr * 1.5, 4.50), 2)
+        risk_dist = round(max(atr * 1.8, 6.50), 2)
 
-        # Only take Bullish Breakout if H1 is Bullish AND RSI is not overbought (> 68)
-        if current_price > donch_high and h1_trend_bull and rsi <= 68.0:
+        # Only take Bullish Breakout if H1 is Bullish AND RSI is in momentum range (not overbought > 62)
+        if current_price > donch_high and h1_trend_bull and (45.0 <= rsi <= 62.0):
             entry = round(current_price, 2)
             sl = round(entry - risk_dist, 2)
             tp1 = round(entry + (risk_dist * 1.5), 2)
             tp2 = round(entry + (risk_dist * 2.8), 2)
+            be_trig = round(entry + max(risk_dist * 0.85, 5.00), 2)
             return CandidateSignal(
                 strategy_name=cls.name, action="BUY", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                be_trigger=round(entry + 2.0, 2), risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
-                confidence=84.0, rationale=f"H1 Bull Breakout above 20-bar Donchian High (${donch_high:.2f}) with RSI {rsi:.1f}.",
+                be_trigger=be_trig, risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
+                confidence=78.0, rationale=f"H1 Bull Breakout above 20-bar Donchian High (${donch_high:.2f}) with RSI {rsi:.1f}.",
                 bar_time=bar_time
             )
-        # Only take Bearish Breakout if H1 is Bearish AND RSI is not oversold (< 32)
-        elif current_price < donch_low and h1_trend_bear and rsi >= 32.0:
+        # Only take Bearish Breakout if H1 is Bearish AND RSI is in momentum range (not oversold < 38)
+        elif current_price < donch_low and h1_trend_bear and (38.0 <= rsi <= 55.0):
             entry = round(current_price, 2)
             sl = round(entry + risk_dist, 2)
             tp1 = round(entry - (risk_dist * 1.5), 2)
             tp2 = round(entry - (risk_dist * 2.8), 2)
+            be_trig = round(entry - max(risk_dist * 0.85, 5.00), 2)
             return CandidateSignal(
                 strategy_name=cls.name, action="SELL", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                be_trigger=round(entry - 2.0, 2), risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
-                confidence=84.0, rationale=f"H1 Bear Breakout below 20-bar Donchian Low (${donch_low:.2f}) with RSI {rsi:.1f}.",
+                be_trigger=be_trig, risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
+                confidence=78.0, rationale=f"H1 Bear Breakout below 20-bar Donchian Low (${donch_low:.2f}) with RSI {rsi:.1f}.",
                 bar_time=bar_time
             )
 
@@ -259,22 +261,23 @@ class VolatilitySqueezeStrategy:
         loss = (-diffs.clip(upper=0)).rolling(14).mean()
         rsi = float((100 - (100 / (1 + (gain / (loss + 1e-9))))).iloc[-1])
 
-        risk_dist = round(max(atr * 1.5, 4.50), 2)
+        risk_dist = round(max(atr * 1.8, 6.50), 2)
         momentum = current_price - float(sma20.iloc[-1])
 
         # Expansion fire WITH H1 Trend Alignment & RSI reload zone (NOT exhausted)
-        is_firing_long = bb_upper > kc_upper and momentum > 0 and h1_trend_bull and (45.0 <= rsi <= 65.0)
-        is_firing_short = bb_lower < kc_lower and momentum < 0 and h1_trend_bear and (35.0 <= rsi <= 55.0)
+        is_firing_long = bb_upper > kc_upper and momentum > 0 and h1_trend_bull and (45.0 <= rsi <= 62.0)
+        is_firing_short = bb_lower < kc_lower and momentum < 0 and h1_trend_bear and (38.0 <= rsi <= 55.0)
 
         if is_firing_long:
             entry = round(current_price, 2)
             sl = round(entry - risk_dist, 2)
             tp1 = round(entry + (risk_dist * 1.5), 2)
             tp2 = round(entry + (risk_dist * 2.8), 2)
+            be_trig = round(entry + max(risk_dist * 0.85, 5.00), 2)
             return CandidateSignal(
                 strategy_name=cls.name, action="BUY", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                be_trigger=round(entry + 2.0, 2), risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
-                confidence=86.0, rationale=f"Bullish Squeeze Expansion confirmed by H1 trend (RSI {rsi:.1f}).",
+                be_trigger=be_trig, risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
+                confidence=78.0, rationale=f"Bullish Squeeze Expansion confirmed by H1 trend (RSI {rsi:.1f}).",
                 bar_time=bar_time
             )
         elif is_firing_short:
@@ -282,10 +285,11 @@ class VolatilitySqueezeStrategy:
             sl = round(entry + risk_dist, 2)
             tp1 = round(entry - (risk_dist * 1.5), 2)
             tp2 = round(entry - (risk_dist * 2.8), 2)
+            be_trig = round(entry - max(risk_dist * 0.85, 5.00), 2)
             return CandidateSignal(
                 strategy_name=cls.name, action="SELL", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                be_trigger=round(entry - 2.0, 2), risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
-                confidence=86.0, rationale=f"Bearish Squeeze Expansion confirmed by H1 trend (RSI {rsi:.1f}).",
+                be_trigger=be_trig, risk_reward="1 : 1.5", risk_pips=risk_dist * 10,
+                confidence=78.0, rationale=f"Bearish Squeeze Expansion confirmed by H1 trend (RSI {rsi:.1f}).",
                 bar_time=bar_time
             )
 

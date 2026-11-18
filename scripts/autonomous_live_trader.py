@@ -123,8 +123,9 @@ class ProductionRuntimeManager:
     def is_alerts_enabled(self) -> bool:
         return bool(self.state.get("alerts_enabled", True))
 
-    def record_prediction(self, action: str, entry: float, sl: float, tp1: float, tp2: float, bar_time: str, confidence: float = 80.0, rsi: float = 50.0):
+    def record_prediction(self, action: str, entry: float, sl: float, tp1: float, tp2: float, bar_time: str, confidence: float = 80.0, rsi: float = 50.0, be_trigger: float | None = None):
         t_id = f"pred_{int(time.time())}"
+        default_be = entry + max(abs(entry - sl) * 0.85, 5.0) if action == "BUY" else entry - max(abs(entry - sl) * 0.85, 5.0)
         trade = {
             "id": t_id,
             "action": action,
@@ -132,6 +133,7 @@ class ProductionRuntimeManager:
             "sl": sl,
             "tp1": tp1,
             "tp2": tp2,
+            "be_trigger": be_trigger if be_trigger is not None else default_be,
             "time": bar_time,
             "status": "OPEN",
             "be_active": False,
@@ -154,13 +156,14 @@ class ProductionRuntimeManager:
             entry = t["entry"]
             tp1 = t["tp1"]
             sl = t["sl"]
+            be_threshold = t.get("be_trigger", entry + max(abs(entry - sl) * 0.85, 5.0) if act == "BUY" else entry - max(abs(entry - sl) * 0.85, 5.0))
 
             if act == "BUY":
-                # Check BE threshold (+20 pips)
-                if not t.get("be_active") and high >= entry + 2.0:
+                # Dynamic BE threshold (requires substantive impulse >= 0.85R before BE to prevent wick stop-outs)
+                if not t.get("be_active") and high >= be_threshold:
                     t["be_active"] = True
                     t["sl"] = entry # Protected to BE!
-                    updated = f"BUY moved to BREAK-EVEN (Risk-Free) at {entry:.2f} (+20 pips profit secured)"
+                    updated = f"BUY moved to BREAK-EVEN (Risk-Free) at {entry:.2f} (Target {be_threshold:.2f} reached)"
                     log_audit_record({"event": "BREAK_EVEN_TRIGGERED", "trade_id": t.get("id"), "action": act, "entry": entry})
                 if high >= tp1:
                     t["status"] = "WIN"
@@ -182,11 +185,11 @@ class ProductionRuntimeManager:
                         log_audit_record({"event": "TRADE_RESOLVED", "outcome": "BE_EXIT", "pips": 0.0, "exit_price": t['sl'], **t})
 
             elif act == "SELL":
-                # Check BE threshold (+20 pips)
-                if not t.get("be_active") and low <= entry - 2.0:
+                # Dynamic BE threshold
+                if not t.get("be_active") and low <= be_threshold:
                     t["be_active"] = True
                     t["sl"] = entry
-                    updated = f"SELL moved to BREAK-EVEN (Risk-Free) at {entry:.2f} (+20 pips profit secured)"
+                    updated = f"SELL moved to BREAK-EVEN (Risk-Free) at {entry:.2f} (Target {be_threshold:.2f} reached)"
                     log_audit_record({"event": "BREAK_EVEN_TRIGGERED", "trade_id": t.get("id"), "action": act, "entry": entry})
                 if low <= tp1:
                     t["status"] = "WIN"
@@ -600,6 +603,12 @@ def run_24_7_service():
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 robust_send_telegram(token, u_chat, format_card(setup, "INSTANT MASTER SETUP"))
 
+                            elif text.startswith("/pulse"):
+                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                setup = analyze_with_6_master_upgrades(df, mgr)
+                                pulse_card = format_telemetry_pulse(setup, broker, mgr)
+                                robust_send_telegram(token, u_chat, pulse_card)
+
                             elif text.startswith("/status") or text.startswith("/learn"):
                                 df = fetch_live_candles("XAUUSD", "M5", 50)
                                 setup = analyze_with_6_master_upgrades(df, mgr)
@@ -754,7 +763,17 @@ def run_24_7_service():
                                 card = format_card(setup, "24/7 MASTER AI SIGNAL")
                                 for cid in list(subscribers):
                                     robust_send_telegram(token, cid, card)
-                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], candle_bar_time, setup["confidence"], setup["rsi"])
+                                mgr.record_prediction(
+                                    action=setup["action"],
+                                    entry=setup["entry"],
+                                    sl=setup["sl"],
+                                    tp1=setup["tp1"],
+                                    tp2=setup["tp2"],
+                                    bar_time=candle_bar_time,
+                                    confidence=setup["confidence"],
+                                    rsi=setup["rsi"],
+                                    be_trigger=setup.get("be_trigger"),
+                                )
                                 if len(broker.open_positions) == 0:
                                     executed_pos = broker.execute_order(
                                         side=setup["action"],
@@ -774,12 +793,14 @@ def run_24_7_service():
                             mgr.state["last_alerted_candle"] = candle_bar_time
                             mgr.save_state()
 
-                        # 3. Continuous ~30s Telemetry Pulse (Sends ~2 notifications per minute so user sees real-time AI tracking)
-                        if not (should_alert and is_actionable):
+                        # 3. Controlled Telemetry Heartbeat (Dispatched at most once per hour to prevent chat flooding)
+                        pulse_interval = int(os.getenv("TELEMETRY_PULSE_INTERVAL_SEC", "3600"))
+                        if not (should_alert and is_actionable) and (now - last_pulse_time >= pulse_interval):
+                            last_pulse_time = now
                             pulse_card = format_telemetry_pulse(setup, broker, mgr)
                             for cid in list(subscribers):
                                 robust_send_telegram(token, cid, pulse_card)
-                            logger.info("Dispatched 30s live telemetry pulse to %d subscriber(s) (Gold: $%.2f, Bias: %s)", len(subscribers), setup["price"], setup["action"])
+                            logger.info("Dispatched periodic telemetry pulse to %d subscriber(s) (Gold: $%.2f, Bias: %s)", len(subscribers), setup["price"], setup["action"])
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)

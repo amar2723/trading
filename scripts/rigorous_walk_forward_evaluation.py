@@ -517,8 +517,11 @@ def run_rigorous_evaluation():
     lgb_c_base.fit(X_dev[:dev_cal_split], y_dev[:dev_cal_split])
 
     p_dev_c_ens = (xgb_c_base.predict_proba(X_dev[dev_cal_split:])[:, 1] * 0.55) + (lgb_c_base.predict_proba(X_dev[dev_cal_split:])[:, 1] * 0.45)
+    # Anchor calibration boundaries at (0, 0) and (1, 1) to prevent flatline clipping at high confidence
+    p_dev_anchored = np.concatenate([[0.0], p_dev_c_ens, [1.0]])
+    y_dev_anchored = np.concatenate([[0.0], y_dev[dev_cal_split:], [1.0]])
     calibrator_final = IsotonicRegression(out_of_bounds="clip")
-    calibrator_final.fit(p_dev_c_ens, y_dev[dev_cal_split:])
+    calibrator_final.fit(p_dev_anchored, y_dev_anchored)
 
     prod_model_path = ROOT / "models/xauusd_master_ensemble.pkl"
     joblib.dump({

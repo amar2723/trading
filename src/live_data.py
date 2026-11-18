@@ -164,6 +164,15 @@ def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: 
         return df.tail(bars).reset_index(drop=True)
 
 
+def is_terminal_process_active() -> bool:
+    try:
+        import subprocess
+        out = subprocess.check_output('tasklist /fi "imagename eq terminal64.exe"', shell=True).decode(errors="ignore")
+        return "terminal64.exe" in out.lower()
+    except Exception:
+        return False
+
+
 def fetch_live_candles(
     symbol: str = "XAUUSD",
     timeframe: str = "M5",
@@ -173,13 +182,13 @@ def fetch_live_candles(
 ) -> pd.DataFrame:
     """
     Fetch the latest live candles.
-    Prioritizes real MT5 broker spot feed when configured.
+    Prioritizes real MT5 broker spot feed when configured and terminal process is open.
     If require_broker_spot is True and MT5 is unavailable, returns empty DataFrame with HOLD warning.
     """
-    # 1. MT5 broker spot quote feed (Primary when MT5 terminal is configured and active)
-    if mt5 is not None and os.environ.get("USE_MT5", "0") == "1":
+    # 1. MT5 broker spot quote feed (Primary when MT5 desktop terminal process is actively running)
+    if mt5 is not None and os.environ.get("USE_MT5", "0") == "1" and is_terminal_process_active():
         try:
-            if mt5.initialize(timeout=5000):
+            if mt5.initialize(timeout=3000):
                 tf = TIMEFRAMES.get(timeframe.upper(), mt5.TIMEFRAME_M5)
                 if mt5.symbol_select(symbol, True):
                     # Query pos=1 to guarantee querying only fully closed historical bars
