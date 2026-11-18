@@ -262,8 +262,10 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     elif sig_squeeze.action != "HOLD":
         chosen_sig = sig_squeeze
 
-    # Check for Futures Proxy Data Source
-    is_futures_proxy = bool(df.get("is_futures_proxy", pd.Series([False])).iloc[-1])
+    # Strict Broker Spot Provenance Verification
+    # Untagged or non-broker feeds strictly default to is_broker_spot=False
+    is_broker_spot = bool(df["is_broker_spot"].iloc[-1]) if "is_broker_spot" in df.columns else False
+    data_source = str(df["data_source"].iloc[-1]) if "data_source" in df.columns else "UNKNOWN"
 
     if chosen_sig is None or chosen_sig.action == "HOLD":
         action = "HOLD"
@@ -282,8 +284,8 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             f"• 4. Indicators: RSI at {rsi_val:.1f} (Neutral/Wait), Buyer Flow {buyer_pct}% vs {seller_pct}%.\n"
             f"• 5. Action: Standing by for high-probability H1 EMA 20/50 test."
         )
-    elif is_futures_proxy and os.environ.get("ALLOW_PROXY_EXECUTION", "0") != "1":
-        # SAFETY VETO: Do not permit execution-qualified signals on futures proxy
+    elif not (is_broker_spot and data_source == "BROKER_MT5_SPOT"):
+        # STRICT SAFETY VETO: Live trading execution prohibited on non-broker data
         action = "HOLD"
         entry = current_price
         sl = current_price
@@ -291,11 +293,11 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         tp2 = current_price
         be_trigger = current_price
         risk_dist = 0.0
-        active_strategy = f"{chosen_sig.strategy_name} (BLOCKED_FUTURES_PROXY)"
+        active_strategy = f"{chosen_sig.strategy_name} (BLOCKED_NON_BROKER_DATA)"
         confidence = 0.0
         why = (
-            "• 1. HOLD: Execution-qualified signals prohibited on Yahoo GC=F futures proxy.\n"
-            "• 2. Broker spot feed (MT5) is unavailable.\n"
+            f"• 1. HOLD: Execution strictly prohibited on non-broker data source '{data_source}'.\n"
+            "• 2. Verified broker spot feed (BROKER_MT5_SPOT) is required for live execution.\n"
             "• 3. Risk Guard: Capital strictly preserved on sidelines (0 risk exposure)."
         )
     else:

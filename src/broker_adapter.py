@@ -170,11 +170,20 @@ class OctaBrokerAdapter:
                         self.closed_positions.append(pos)
                         if row.get("account_equity"):
                             self.equity = float(row["account_equity"])
-                if self.equity < 10.0:
-                    logger.info("Demo account equity ($%.2f) below margin. Resetting demo balance to initial deposit ($%.2f).", self.equity, self.equity if self.equity >= 10 else 40.68)
-                    self.equity = 40.68
+                logger.info("Restored demo account equity ($%.2f) from ledger without silent reset.", self.equity)
             except Exception as e:
                 logger.warning("Could not restore closed positions from CSV: %s", e)
+
+    def record_deposit(self, amount: float, reason: str = "Deposit") -> float:
+        """
+        Explicitly records an auditable capital deposit or adjustment.
+        Never resets equity silently.
+        """
+        if amount <= 0:
+            raise ValueError(f"Deposit amount must be positive, got {amount}")
+        self.equity = round(self.equity + amount, 2)
+        logger.info("Auditable account deposit: +$%.2f (%s). New equity: $%.2f", amount, reason, self.equity)
+        return self.equity
 
     def _check_mt5_connection(self):
         # Default safely to Octa High-Fidelity Shadow Demo to guarantee non-blocking, reliable execution

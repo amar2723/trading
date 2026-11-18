@@ -128,7 +128,17 @@ def compute_indicator_dataframe(
         df["h1_dist_ema50"] = ((merged["close"] - merged["h1_ema50"]) / merged["h1_ema50"] * 100.0).fillna(0.0)
         df["h1_close"] = merged["h1_close"]
         df["h1_completed_at"] = merged["h1_completed_at"]
-        df["h1_source"] = "BROKER_H1_MERGE_ASOF"
+
+        # Preserve provenance identity of H1 source
+        is_futures = False
+        if "is_futures_proxy" in h1.columns and bool(h1["is_futures_proxy"].iloc[-1]):
+            is_futures = True
+        elif "data_source" in h1.columns and any("FUTURES" in str(x).upper() for x in h1["data_source"]):
+            is_futures = True
+        elif "is_broker_spot" in h1.columns and not bool(h1["is_broker_spot"].iloc[-1]):
+            is_futures = True
+
+        df["h1_source"] = "FUTURES_H1_MERGE_ASOF" if is_futures else "BROKER_H1_MERGE_ASOF"
     elif "h1_trend_bias" in df.columns and "h1_dist_ema50" in df.columns:
         # Preserve previously merged / computed causal H1 features (do not overwrite with M5 proxy)
         if "h1_source" not in df.columns:

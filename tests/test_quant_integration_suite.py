@@ -226,7 +226,7 @@ def test_stale_candle_rejection():
     assert "stale candles" in reason.lower()
 
 
-# 9. Test Futures-to-Spot Mismatch Failsafe
+# 9. Test Futures-to-Spot Mismatch Failsafe & Strict Provenance Gating
 def test_futures_to_spot_mismatch_failsafe():
     mgr = ProductionRuntimeManager()
     dates = pd.date_range("2026-11-18 10:00", periods=50, freq="5min")
@@ -243,14 +243,14 @@ def test_futures_to_spot_mismatch_failsafe():
         "is_broker_spot": False,
     })
 
-    # Disallow proxy execution
-    os.environ["ALLOW_PROXY_EXECUTION"] = "0"
+    # Even if ALLOW_PROXY_EXECUTION is set, strict safety veto prohibits execution
+    os.environ["ALLOW_PROXY_EXECUTION"] = "1"
     analysis = analyze_with_6_master_upgrades(df_futures, mgr)
 
-    # If setup fired, it must be blocked to HOLD with clear proxy reason
-    if "BLOCKED_FUTURES_PROXY" in analysis["strategy"]:
+    # If setup fired, it must be strictly blocked to HOLD with clear provenance reason
+    if "BLOCKED_NON_BROKER_DATA" in analysis["strategy"]:
         assert analysis["action"] == "HOLD"
-        assert "execution-qualified signals prohibited on yahoo gc=f futures proxy" in analysis["why"].lower()
+        assert "execution strictly prohibited on non-broker data source" in analysis["why"].lower()
 
 
 # 10. Test Full Autonomous Scanner Initialization
@@ -268,6 +268,7 @@ def test_full_autonomous_scanner_initialization():
         "low": close_vals - 0.5,
         "close": close_vals,
         "tick_volume": [200.0] * 60,
+        "data_source": "BROKER_MT5_SPOT",
         "is_futures_proxy": False,
         "is_broker_spot": True,
     })
@@ -277,3 +278,113 @@ def test_full_autonomous_scanner_initialization():
     assert "price" in analysis
     assert "ml_decision" in analysis
     assert "risk_approved" in analysis
+
+
+# 11. Test Forming / In-Progress Candle Rejection
+def test_forming_candle_rejection():
+    # Construct candle where latest bar started 2 minutes ago (closes in 3 minutes for M5)
+    now_utc = datetime.now(timezone.utc)
+    forming_start = now_utc - timedelta(minutes=2)
+    dates = [forming_start - timedelta(minutes=5 * (24 - i)) for i in range(25)]
+
+    df_forming = pd.DataFrame({
+        "timestamp": dates,
+        "open": [2600.0] * 25,
+        "high": [2605.0] * 25,
+        "low": [2595.0] * 25,
+        "close": [2602.0] * 25,
+    })
+
+    valid, reason = validate_candle_dataframe(df_forming, timeframe="M5", max_age_minutes=30.0)
+    assert not valid
+    assert "forming candle detected" in reason.lower()
+
+    # Closed fresh candle (started 8 minutes ago, closed 3 minutes ago)
+    closed_start = now_utc - timedelta(minutes=8)
+    dates_closed = [closed_start - timedelta(minutes=5 * (24 - i)) for i in range(25)]
+    df_closed = pd.DataFrame({
+        "timestamp": dates_closed,
+        "open": [2600.0] * 25,
+        "high": [2605.0] * 25,
+        "low": [2595.0] * 25,
+        "close": [2602.0] * 25,
+    })
+    valid_c, reason_c = validate_candle_dataframe(df_closed, timeframe="M5", max_age_minutes=30.0)
+    assert valid_c
+    assert reason_c == "OK"
+
+
+# 12. Test Elimination of Silent Account-Equity Resets
+def test_no_silent_equity_resets():
+    adapter = OctaBrokerAdapter(initial_demo_equity=40.68)
+    adapter.equity = 7.42
+    # Verify equity is not silently bumped back to 40.68
+    assert adapter.get_account_equity() == 7.42
+
+    # Verify auditable deposit method works
+    new_equity = adapter.record_deposit(100.0, "Verified Test Deposit")
+    assert new_equity == 107.42
+    assert adapter.get_account_equity() == 107.42
+
+
+# 13. Test H1 Provenance Identity Carry-Through
+def test_h1_provenance_carry_through():
+    df_m5, df_h1 = create_synthetic_market_data()
+
+    # Case A: Futures proxy H1 data
+    df_h1_futures = df_h1.copy()
+    df_h1_futures["is_futures_proxy"] = True
+    df_h1_futures["data_source"] = "YAHOO_GC_F_FUTURES_PROXY"
+    df_h1_futures["is_broker_spot"] = False
+
+    merged_futures = compute_indicator_dataframe(df_m5, df_h1_futures)
+    assert merged_futures["h1_source"].iloc[-1] == "FUTURES_H1_MERGE_ASOF"
+
+    # Case B: Verified broker spot H1 data
+    df_h1_spot = df_h1.copy()
+    df_h1_spot["is_futures_proxy"] = False
+    df_h1_spot["data_source"] = "BROKER_MT5_SPOT"
+    df_h1_spot["is_broker_spot"] = True
+
+    merged_spot = compute_indicator_dataframe(df_m5, df_h1_spot)
+    assert merged_spot["h1_source"].iloc[-1] == "BROKER_H1_MERGE_ASOF"
+
+
+# 14. Test MLMetaFilter Default Args & Abstain on Missing H1
+def test_ml_meta_filter_none_defaults_and_failsafe():
+    meta = MLMetaFilter(model_path=ENSEMBLE_PATH)
+    df_m5, df_h1 = create_synthetic_market_data()
+
+    # Precomputed dataframe with bearish H1 bias (-1)
+    df_proc = compute_indicator_dataframe(df_m5, df_h1)
+    df_proc["h1_trend_bias"] = -1
+    df_proc["h1_dist_ema50"] = -0.75
+
+    # Calling without explicit h1_trend_bias argument must NOT override to +1
+    last_row = df_proc.iloc[-1].to_dict()
+    feat_row = extract_features_from_row(last_row, "SELL", "H1_PULLBACK")
+    assert feat_row["htf_trend_bias"].iloc[0] == -1
+    assert abs(feat_row["h1_dist_ema50"].iloc[0] - (-0.75)) < 1e-4
+
+    # Calling with dataframe missing H1 features must fail-safe to ABSTAIN
+    df_raw = df_m5[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    # Remove H1 features if any
+    decision = meta.evaluate_candidate(
+        candidate_action="BUY",
+        strategy_name="H1_PULLBACK",
+        df_m5=df_raw,
+        h1_trend_bias=None,
+        h1_dist_ema50=None,
+    )
+    # The feature pipeline computes indicator df which uses M5_PROXY_240_EMA fallback when df_h1 is None,
+    # so h1_trend_bias is populated. If we strip it from last_row completely:
+    df_stripped = df_proc.drop(columns=["h1_trend_bias", "h1_dist_ema50"])
+    decision_stripped = meta.evaluate_candidate(
+        candidate_action="BUY",
+        strategy_name="H1_PULLBACK",
+        df_m5=df_stripped,
+        h1_trend_bias=None,
+        h1_dist_ema50=None,
+    )
+    assert decision_stripped.decision == "ABSTAIN"
+    assert "Missing required H1 higher-timeframe features" in decision_stripped.filter_reason

@@ -58,8 +58,8 @@ class MLMetaFilter:
         candidate_action: str,
         strategy_name: str,
         df_m5: pd.DataFrame,
-        h1_trend_bias: int = 1,
-        h1_dist_ema50: float = 0.0,
+        h1_trend_bias: int | None = None,
+        h1_dist_ema50: float | None = None,
         risk_usd: float = 4.50,
         min_expected_R: float = 0.15,
     ) -> FilterDecision:
@@ -92,6 +92,16 @@ class MLMetaFilter:
             last_row["h1_trend_bias"] = h1_trend_bias
         if h1_dist_ema50 is not None:
             last_row["h1_dist_ema50"] = h1_dist_ema50
+
+        # Safety check: fail-safe ABSTAIN if required H1 higher-timeframe features are missing
+        if "h1_trend_bias" not in last_row or "h1_dist_ema50" not in last_row or pd.isna(last_row.get("h1_trend_bias")):
+            return FilterDecision(
+                decision="ABSTAIN",
+                predicted_win_prob=0.0,
+                expected_R=-1.0,
+                confidence_pct=0.0,
+                filter_reason="ABSTAIN: Missing required H1 higher-timeframe features (h1_trend_bias/h1_dist_ema50).",
+            )
 
         feat_row = extract_features_from_row(last_row, candidate_action, strategy_name)
 

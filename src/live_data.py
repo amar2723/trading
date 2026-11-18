@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -43,6 +43,16 @@ TIMEFRAMES = (
     else {}
 )
 
+TIMEFRAME_MINUTES = {
+    "M1": 1,
+    "M5": 5,
+    "M15": 15,
+    "M30": 30,
+    "H1": 60,
+    "H4": 240,
+    "D1": 1440,
+}
+
 
 def validate_candle_dataframe(
     df: pd.DataFrame,
@@ -51,8 +61,8 @@ def validate_candle_dataframe(
     min_bars: int = 20,
 ) -> tuple[bool, str]:
     """
-    Validates that a candle DataFrame is fully closed, chronologically ordered,
-    UTC-normalized, and within the freshness window.
+    Validates that a candle DataFrame contains fully closed candles, is chronologically
+    ordered, UTC-normalized, non-forming, and within the allowable freshness window.
     Returns (True, "OK") or (False, reason).
     """
     if df is None or df.empty:
@@ -83,17 +93,33 @@ def validate_candle_dataframe(
     if ts.duplicated().any():
         return False, "Duplicate candle timestamps detected."
 
-    # Freshness validation against current UTC time
+    # Candle closure verification against timeframe interval
+    # In financial time series, timestamp T for an M-minute bar covers [T, T + M).
+    # The candle is strictly completed/closed only when current time >= T + M.
+    tf_minutes = TIMEFRAME_MINUTES.get(timeframe.upper(), 5)
     latest_ts = ts.iloc[-1].to_pydatetime()
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+
+    candle_close_time = latest_ts + timedelta(minutes=tf_minutes)
     now_utc = datetime.now(timezone.utc)
-    age_seconds = (now_utc - latest_ts).total_seconds()
+
+    if now_utc < candle_close_time:
+        return False, (
+            f"Incomplete/forming candle detected: bar starting at {latest_ts.isoformat()} "
+            f"for timeframe {timeframe} closes at {candle_close_time.isoformat()} "
+            f"(current time is {now_utc.isoformat()})."
+        )
+
+    # Freshness validation against elapsed time since bar closure
+    age_seconds = (now_utc - candle_close_time).total_seconds()
     age_minutes = age_seconds / 60.0
 
     if age_minutes < -5.0:
-        return False, f"Future timestamp detected: latest candle is {-age_minutes:.1f} min in the future."
+        return False, f"Future timestamp detected: candle closure is {-age_minutes:.1f} min in the future."
 
     if age_minutes > max_age_minutes:
-        return False, f"Stale candles: latest bar is {age_minutes:.1f} min old (max allowed: {max_age_minutes:.1f} min)."
+        return False, f"Stale candles: latest bar closed {age_minutes:.1f} min ago (max allowed: {max_age_minutes:.1f} min)."
 
     return True, "OK"
 
@@ -154,7 +180,9 @@ def fetch_live_candles(
             if mt5.initialize(timeout=5000):
                 tf = TIMEFRAMES.get(timeframe.upper(), mt5.TIMEFRAME_M5)
                 if mt5.symbol_select(symbol, True):
-                    rates = mt5.copy_rates_from_pos(symbol, tf, 0, bars)
+                    # Query pos=1 to guarantee querying only fully closed historical bars
+                    # (pos=0 represents the actively forming in-progress bar)
+                    rates = mt5.copy_rates_from_pos(symbol, tf, 1, bars)
                     if rates is not None and len(rates) > 0:
                         df = pd.DataFrame(rates)
                         df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True).tz_localize(None)
@@ -170,7 +198,9 @@ def fetch_live_candles(
                             logger.info("Fetched %d validated spot candles from MT5 broker (%s)", len(df), symbol)
                             return df[["timestamp", "open", "high", "low", "close", "volume", "tick_volume", "data_source", "is_broker_spot", "is_futures_proxy"]].reset_index(drop=True)
                         else:
-                            logger.warning("MT5 candle validation failed: %s", reason)
+                            logger.error("MT5 candle validation failed: %s. Rejecting invalid data.", reason)
+                            mt5.shutdown()
+                            return pd.DataFrame()
                 mt5.shutdown()
         except Exception as exc:
             logger.warning("MT5 spot feed attempt failed: %s. Falling back to web proxy.", exc)
@@ -187,8 +217,8 @@ def fetch_live_candles(
             if valid:
                 return df
             else:
-                logger.warning("Web proxy candle validation notice: %s", reason)
-                return df
+                logger.error("Web proxy candle validation failed: %s. Rejecting invalid data.", reason)
+                return pd.DataFrame()
     except Exception as exc:
         logger.warning("Primary web live fetch attempt failed: %s", exc)
 

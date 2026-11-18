@@ -91,7 +91,7 @@ class EventDrivenBacktestEngine:
         initial_equity: float = 1000.0,
         max_risk_pct: float = 1.0,
         contract_size: float = 100.0,
-        spread_usd: float = 0.24,          # 24 pips = $0.24/oz typical spread
+        spread_usd: float = 0.42,          # Verified Octa typical gold spread ~4.2 pips ($0.42/oz)
         entry_slippage_usd: float = 0.05,  # $0.05/oz
         exit_slippage_usd: float = 0.05,   # $0.05/oz
         min_expected_R: float = 0.15,
@@ -399,7 +399,7 @@ class EventDrivenBacktestEngine:
                         equity=self.equity,
                         risk_pips=risk_pips,
                         stop_dist_usd=risk_dist,
-                        current_spread_pips=self.spread_usd * 100.0,
+                        current_spread_pips=round(self.spread_usd * 10.0, 1),
                         open_positions_count=open_pos_count,
                         daily_loss_R=daily_losses_R,
                         is_reconciled=True,
