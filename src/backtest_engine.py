@@ -27,6 +27,7 @@ from src.strategies.benchmark_strategies import (
 )
 from src.ml_meta_filter import MLMetaFilter, FilterDecision
 from src.risk_governor import RiskGovernor, RiskApproval
+from src.feature_pipeline import compute_indicator_dataframe, extract_features_from_row
 
 
 @dataclass
@@ -128,27 +129,8 @@ class EventDrivenBacktestEngine:
         if n_bars < 60:
             raise ValueError(f"Insufficient bars for backtesting ({n_bars} < 60).")
 
-        # Ensure precomputed indicators for high-performance non-allocating backtesting
-        if "ema_20" not in df.columns:
-            df["ema_20"] = df["close"].ewm(span=20).mean()
-        if "ema_50" not in df.columns:
-            df["ema_50"] = df["close"].ewm(span=50).mean()
-        if "donch_h20" not in df.columns:
-            df["donch_h20"] = df["high"].rolling(20).max().shift(1)
-        if "donch_l20" not in df.columns:
-            df["donch_l20"] = df["low"].rolling(20).min().shift(1)
-        if "atr" not in df.columns:
-            tr = np.maximum(df["high"] - df["low"], np.maximum(np.abs(df["high"] - df["close"].shift(1)), np.abs(df["low"] - df["close"].shift(1))))
-            df["atr"] = tr.rolling(14).mean()
-        if "rsi" not in df.columns:
-            diffs = df["close"].diff()
-            gain = diffs.clip(lower=0).rolling(14).mean()
-            loss = (-diffs.clip(upper=0)).rolling(14).mean()
-            df["rsi"] = 100.0 - (100.0 / (1.0 + (gain / (loss + 1e-9))))
-        if "h1_trend_bias" not in df.columns:
-            h1_trend = df["close"].ewm(span=240).mean()
-            df["h1_trend_bias"] = np.where(df["close"] > h1_trend, 1, -1)
-            df["h1_dist_ema50"] = (df["close"] - h1_trend) / h1_trend * 100.0
+        # Ensure precomputed indicators via shared feature pipeline
+        df = compute_indicator_dataframe(df)
 
         # Tracking state
         self.equity = self.initial_equity
@@ -207,21 +189,40 @@ class EventDrivenBacktestEngine:
                     tp1 = order["tp1"]
                     tp2 = order["tp2"]
 
-                risk_dist_usd = abs(fill_price - sl)
+                # RE-EVALUATE MONETARY RISK ON ACTUAL FILL PRICE
+                actual_stop_dist = abs(fill_price - sl)
+                friction_per_oz = self.spread_usd + self.entry_slippage_usd + self.exit_slippage_usd
+                loss_per_lot_usd = self.contract_size * (actual_stop_dist + friction_per_oz)
+                max_risk_allowed_usd = self.equity * (self.risk_governor.max_risk_pct / 100.0)
+
+                # Verify or resize volume if fill price widened stop distance
+                raw_vol = max_risk_allowed_usd / loss_per_lot_usd
+                safe_lots = round(math.floor(raw_vol / 0.01) * 0.01, 2)
+
+                # STRICT ZERO AUTO-BUMPING: if safe lots < 0.01, REJECT order before fill
+                if safe_lots < 0.01:
+                    risk_vetoed_count += 1
+                    active_trade = None
+                    continue
+
+                actual_lots = min(lots, safe_lots)
+                actual_risk_usd = round(actual_lots * loss_per_lot_usd, 2)
+                actual_risk_pct = round((actual_risk_usd / self.equity) * 100.0, 2)
+
                 active_trade = BacktestTrade(
                     ticket=f"SIM_{i}_{side}",
                     symbol="XAUUSD",
                     side=side,
-                    lots=lots,
+                    lots=actual_lots,
                     signal_time=order["signal_time"],
                     entry_time=bar_time,
                     entry_price=fill_price,
                     initial_sl=sl,
                     tp1=tp1,
                     tp2=tp2,
-                    risk_dist_usd=risk_dist_usd,
-                    risk_usd=order["risk_usd"],
-                    risk_pct=order["risk_pct"],
+                    risk_dist_usd=actual_stop_dist,
+                    risk_usd=actual_risk_usd,
+                    risk_pct=actual_risk_pct,
                     be_active=False,
                     current_sl=sl,
                     status="OPEN",

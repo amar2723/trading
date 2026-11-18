@@ -60,6 +60,11 @@ from src.strategies.benchmark_strategies import (
 from src.ml_meta_filter import MLMetaFilter
 from src.risk_governor import RiskGovernor
 from src.backtest_engine import EventDrivenBacktestEngine, BacktestResults
+from src.feature_pipeline import (
+    FEATURE_COLUMNS,
+    compute_indicator_dataframe,
+    extract_features_from_row,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("WalkForwardRigorous")
@@ -75,46 +80,10 @@ def compute_file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def load_dataset(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    ts_cols = [c for c in df.columns if "time" in c.lower() or "date" in c.lower()]
-    ts_col = ts_cols[0]
-    df["timestamp"] = pd.to_datetime(df[ts_col])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    # Clean numeric columns
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    
-    vol_col = "tick_volume" if "tick_volume" in df.columns else ("volume" if "volume" in df.columns else None)
-    if vol_col:
-        df["tick_volume"] = df[vol_col].astype(float)
-    else:
-        df["tick_volume"] = 100.0
-
-    # Indicators
-    df["ema_20"] = df["close"].ewm(span=20).mean()
-    df["ema_50"] = df["close"].ewm(span=50).mean()
-    df["donch_h20"] = df["high"].rolling(20).max().shift(1)
-    df["donch_l20"] = df["low"].rolling(20).min().shift(1)
-
-    tr = np.maximum(
-        df["high"] - df["low"],
-        np.maximum(np.abs(df["high"] - df["close"].shift(1)), np.abs(df["low"] - df["close"].shift(1)))
-    )
-    df["atr"] = tr.rolling(14).mean()
-
-    diffs = df["close"].diff()
-    gain = diffs.clip(lower=0).rolling(14).mean()
-    loss = (-diffs.clip(upper=0)).rolling(14).mean()
-    df["rsi"] = 100.0 - (100.0 / (1.0 + (gain / (loss + 1e-9))))
-
-    # Causal H1 macro trend (approximated via 12-bar rolling M5 EMA)
-    df["h1_ema_trend"] = df["close"].ewm(span=240).mean() # ~20 hours
-    df["h1_trend_bias"] = np.where(df["close"] > df["h1_ema_trend"], 1, -1)
-    df["h1_dist_ema50"] = (df["close"] - df["h1_ema_trend"]) / df["h1_ema_trend"] * 100.0
-
-    return df.dropna().reset_index(drop=True)
+def load_dataset(csv_path: Path, h1_csv_path: Path | None = None) -> pd.DataFrame:
+    df_m5 = pd.read_csv(csv_path)
+    df_h1 = pd.read_csv(h1_csv_path) if h1_csv_path and h1_csv_path.exists() else None
+    return compute_indicator_dataframe(df_m5, df_h1).dropna().reset_index(drop=True)
 
 
 def extract_candidate_setups_with_causal_forward_outcomes(df: pd.DataFrame) -> pd.DataFrame:
@@ -295,7 +264,7 @@ def extract_candidate_setups_with_causal_forward_outcomes(df: pd.DataFrame) -> p
             "dist_ema_50": float((df["close"].iloc[i] - df["ema_50"].iloc[i]) / df["ema_50"].iloc[i] * 100.0),
             "rsi": float(df["rsi"].iloc[i]),
             "atr_pct": float(df["atr"].iloc[i] / df["close"].iloc[i] * 100.0),
-            "buyer_pct": 50.0,
+            "buyer_pct": float(df["buyer_pct"].iloc[i]),
             "is_prime_session": is_prime,
             "is_asian_chop": is_asian,
         })
@@ -320,10 +289,13 @@ def bootstrap_ci(values: np.ndarray, n_boot: int = 1000, ci: float = 0.95) -> tu
 
 def run_rigorous_evaluation():
     raw_path = ROOT / "data/raw/XAUUSD_M5_60d_max.csv"
+    h1_path = ROOT / "data/raw/XAUUSD_1H_2years.csv"
     sha256_hash = compute_file_sha256(raw_path)
     logger.info("Auditing dataset: %s (SHA-256: %s)", raw_path.name, sha256_hash)
+    if h1_path.exists():
+        logger.info("Aligning real broker H1 candles from %s (SHA-256: %s)", h1_path.name, compute_file_sha256(h1_path))
 
-    df_market = load_dataset(raw_path)
+    df_market = load_dataset(raw_path, h1_path if h1_path.exists() else None)
     total_bars = len(df_market)
     start_date = df_market["timestamp"].iloc[0]
     end_date = df_market["timestamp"].iloc[-1]
@@ -332,14 +304,8 @@ def run_rigorous_evaluation():
     df_candidates = extract_candidate_setups_with_causal_forward_outcomes(df_market)
     logger.info("Extracted %d total candidate setups across all candles.", len(df_candidates))
 
-    # Features
-    feature_cols = [
-        "side_code", "is_pullback", "is_donchian",
-        "htf_trend_bias", "h1_dist_ema50",
-        "dist_ema_20", "dist_ema_50", "rsi",
-        "atr_pct", "buyer_pct",
-        "is_prime_session", "is_asian_chop"
-    ]
+    # Shared standardized feature columns
+    feature_cols = FEATURE_COLUMNS
 
     # -------------------------------------------------------------------------
     # CHRONOLOGICAL SPLIT WITH STRICT DEVELOPMENT / TEST BOUNDARY PURGING

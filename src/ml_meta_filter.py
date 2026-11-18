@@ -14,6 +14,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from src.feature_pipeline import (
+    FEATURE_COLUMNS,
+    compute_indicator_dataframe,
+    extract_features_from_row,
+)
+
 logger = logging.getLogger("MLMetaFilter")
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,70 +80,23 @@ class MLMetaFilter:
                 filter_reason="ABSTAIN: ML model ensemble is unavailable or not loaded."
             )
 
-        close = df_m5["close"].values
-        high = df_m5["high"].values
-        low = df_m5["low"].values
-        vol = df_m5["tick_volume"].values if "tick_volume" in df_m5 else df_m5["volume"].values
-        current_price = float(close[-1])
-
-        # EMAs
-        if "ema_20" in df_m5.columns and "ema_50" in df_m5.columns:
-            ema20 = float(df_m5["ema_20"].iloc[-1])
-            ema50 = float(df_m5["ema_50"].iloc[-1])
+        # Build standard feature row using shared feature pipeline
+        if "ema_20" not in df_m5.columns or "atr" not in df_m5.columns or "rsi" not in df_m5.columns:
+            df_proc = compute_indicator_dataframe(df_m5)
         else:
-            ema20 = float(pd.Series(close).ewm(span=20).mean().iloc[-1])
-            ema50 = float(pd.Series(close).ewm(span=50).mean().iloc[-1])
+            df_proc = df_m5
 
-        dist_ema20 = (current_price - ema20) / max(1.0, ema20) * 100.0
-        dist_ema50 = (current_price - ema50) / max(1.0, ema50) * 100.0
+        last_row = df_proc.iloc[-1].to_dict()
+        if h1_trend_bias is not None:
+            last_row["h1_trend_bias"] = h1_trend_bias
+        if h1_dist_ema50 is not None:
+            last_row["h1_dist_ema50"] = h1_dist_ema50
 
-        # Session
-        hour = pd.to_datetime(df_m5["timestamp"].iloc[-1]).hour
-        is_prime = 1 if (7 <= hour <= 10 or 12 <= hour <= 16) else 0
-        is_asian = 1 if (0 <= hour <= 6) else 0
-
-        # ATR
-        if "atr" in df_m5.columns:
-            atr = float(df_m5["atr"].iloc[-1])
-        else:
-            tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
-            atr = float(pd.Series(tr).rolling(14).mean().iloc[-1])
-        atr_pct = (atr / max(1.0, current_price)) * 100.0
-
-        # Signed buyer volume
-        p_diff = np.diff(close[-15:])
-        v_deltas = vol[-14:]
-        b_vol = np.sum(v_deltas[p_diff >= 0])
-        s_vol = np.sum(v_deltas[p_diff < 0])
-        buyer_pct = (b_vol / max(1.0, b_vol + s_vol)) * 100.0
-
-        # RSI
-        if "rsi" in df_m5.columns:
-            rsi = float(df_m5["rsi"].iloc[-1])
-        else:
-            diffs = pd.Series(close).diff()
-            gain = diffs.clip(lower=0).rolling(14).mean()
-            loss = (-diffs.clip(upper=0)).rolling(14).mean()
-            rsi = float((100.0 - (100.0 / (1.0 + (gain / (loss + 1e-9))))).iloc[-1])
-
-        feat_row = pd.DataFrame([{
-            "side_code": 1 if candidate_action == "BUY" else -1,
-            "is_pullback": 1 if "PULLBACK" in strategy_name else 0,
-            "is_donchian": 1 if "DONCHIAN" in strategy_name else 0,
-            "htf_trend_bias": h1_trend_bias,
-            "h1_dist_ema50": h1_dist_ema50,
-            "dist_ema_20": dist_ema20,
-            "dist_ema_50": dist_ema50,
-            "rsi": rsi,
-            "atr_pct": atr_pct,
-            "buyer_pct": buyer_pct,
-            "is_prime_session": is_prime,
-            "is_asian_chop": is_asian,
-        }])
+        feat_row = extract_features_from_row(last_row, candidate_action, strategy_name)
 
         try:
             scaler = self.ensemble.get("scaler")
-            feat_cols = self.ensemble.get("feature_cols", [])
+            feat_cols = self.ensemble.get("feature_cols", FEATURE_COLUMNS)
             missing_cols = [c for c in feat_cols if c not in feat_row.columns]
             if missing_cols:
                 raise ValueError(f"Feature row missing required model columns: {missing_cols}")
@@ -146,15 +105,22 @@ class MLMetaFilter:
             if scaler is not None:
                 X_in = scaler.transform(X_in)
 
-            # Check for probability calibration wrapper or base models
-            if "calibrated_ensemble" in self.ensemble and self.ensemble["calibrated_ensemble"] is not None:
-                win_prob = float(self.ensemble["calibrated_ensemble"].predict_proba(X_in)[0][1])
-            else:
-                p_xgb = float(self.ensemble["xgb_model"].predict_proba(X_in)[0][1])
-                p_lgb = float(self.ensemble["lgb_model"].predict_proba(X_in)[0][1])
-                win_prob = (p_xgb * 0.55) + (p_lgb * 0.45)
+            # Compute raw probabilities from ensemble
+            p_xgb = float(self.ensemble["xgb_model"].predict_proba(X_in)[0][1])
+            p_lgb = float(self.ensemble["lgb_model"].predict_proba(X_in)[0][1])
+            p_raw = (p_xgb * 0.55) + (p_lgb * 0.45)
 
-            win_prob = round(float(win_prob), 4)
+            # Apply saved calibrator if present
+            calibrator = self.ensemble.get("calibrator")
+            if calibrator is not None:
+                try:
+                    p_cal = float(calibrator.predict(np.array([p_raw]))[0])
+                    win_prob = round(float(np.clip(p_cal, 0.0, 1.0)), 4)
+                except Exception as cal_err:
+                    logger.warning("Calibrator inference error (%s); falling back to raw ensemble probability.", cal_err)
+                    win_prob = round(float(p_raw), 4)
+            else:
+                win_prob = round(float(p_raw), 4)
         except Exception as e:
             logger.error("ML inference error: %s. Failsafe ABSTAIN triggered.", e)
             return FilterDecision(

@@ -166,7 +166,11 @@ class OctaBrokerAdapter:
         tp1: float,
         tp2: float,
     ) -> BrokerPosition | None:
-        """Executes a broker order with spread and slippage modeling."""
+        """Executes a broker order with spread and slippage modeling. Rejects invalid volume."""
+        if lots < self.min_lot:
+            logger.warning("Order execution REJECTED: requested volume %.4f is below broker minimum %.2f.", lots, self.min_lot)
+            return None
+
         quote = self.get_symbol_quote(current_price)
         
         # Real execution prices: BUY at Ask, SELL at Bid + realistic 50ms slippage (+0.05 pt)
@@ -183,7 +187,7 @@ class OctaBrokerAdapter:
             ticket=ticket,
             symbol=self.symbol,
             side=side,
-            lots=max(self.min_lot, round(lots, 2)),
+            lots=round(lots, 2),
             open_price=fill_price,
             open_time=now_str,
             sl=sl,
