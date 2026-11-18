@@ -145,7 +145,15 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0, 
         acc_dict = acc_info._asdict() if hasattr(acc_info, "_asdict") else dict(acc_info)
         trade_mode_val = acc_dict.get("trade_mode")
         # MT5 trade modes: 0 = DEMO, 1 = CONTEST, 2 = REAL
-        trade_mode_str = "DEMO" if trade_mode_val == 0 else ("CONTEST" if trade_mode_val == 1 else "REAL")
+        if trade_mode_val == 0:
+            trade_mode_str = "DEMO"
+        elif trade_mode_val == 1:
+            trade_mode_str = "CONTEST"
+        elif trade_mode_val == 2:
+            trade_mode_str = "REAL"
+        else:
+            trade_mode_str = f"UNKNOWN_{trade_mode_val}"
+
         result["account_info"] = {
             "login": acc_dict.get("login"),
             "trade_mode": trade_mode_str,
@@ -185,6 +193,7 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0, 
             "symbol": selected_symbol,
             "digits": sd.get("digits"),
             "point": sd.get("point"),
+            "tick_size": sd.get("trade_tick_size") or sd.get("point"),
             "contract_size": sd.get("trade_contract_size"),
             "volume_min": sd.get("volume_min"),
             "volume_step": sd.get("volume_step"),
@@ -226,27 +235,55 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0, 
         result["notes"].append("symbol_info_tick returned invalid or zero tick data.")
 
     # Strict Validation Gate for CONNECTED_DEMO_VERIFIED
-    if not result["account_info"]:
+    account_info = result["account_info"]
+    terminal_info = result["terminal_info"]
+    symbol_specs = result["symbol_specs"]
+    live_quote = result["live_quote"]
+
+    if not account_info:
         result["status"] = "NO_ACCOUNT_LOGGED_IN"
         result["notes"].append("No trading account is logged in on the MT5 terminal.")
-    elif result["account_info"].get("trade_mode") == "REAL":
-        result["status"] = "BLOCKED_REAL_ACCOUNT"
-        result["notes"].append("SAFETY VETO: Real-money live trading account detected. Automated execution is strictly prohibited on real accounts.")
-    elif not result["terminal_info"].get("connected"):
+    elif not terminal_info.get("connected"):
         result["status"] = "TERMINAL_NOT_CONNECTED_TO_SERVER"
         result["notes"].append("MT5 terminal reports no active connection to broker trade server.")
-    elif not result["symbol_specs"] or (result["symbol_specs"].get("contract_size") or 0) <= 0:
+    elif account_info.get("trade_mode_code") == 2 or account_info.get("trade_mode") == "REAL":
+        result["status"] = "BLOCKED_REAL_ACCOUNT"
+        result["notes"].append("SAFETY VETO: Real-money live trading account detected. Automated execution is strictly prohibited on real accounts.")
+    elif account_info.get("trade_mode_code") == 1 or account_info.get("trade_mode") == "CONTEST":
+        result["status"] = "BLOCKED_CONTEST_ACCOUNT"
+        result["notes"].append("SAFETY VETO: Contest account detected. Automated execution requires a verified DEMO account (trade_mode == 0).")
+    elif account_info.get("trade_mode_code") != 0 or account_info.get("trade_mode") != "DEMO":
+        result["status"] = "BLOCKED_NON_DEMO_ACCOUNT"
+        result["notes"].append(f"SAFETY VETO: Account trade mode ({account_info.get('trade_mode_code')}) is not verified DEMO (code 0).")
+    elif not account_info.get("currency") or not str(account_info.get("currency")).strip():
+        result["status"] = "INVALID_ACCOUNT_CURRENCY"
+        result["notes"].append("Account currency is missing or blank.")
+    elif not symbol_specs or (
+        (symbol_specs.get("contract_size") or 0) <= 0
+        or (symbol_specs.get("point") or 0) <= 0
+        or (symbol_specs.get("tick_size") or 0) <= 0
+        or (symbol_specs.get("volume_min") or 0) <= 0
+        or (symbol_specs.get("volume_step") or 0) <= 0
+    ):
         result["status"] = "INVALID_SYMBOL_SPECS"
-        result["notes"].append(f"Symbol specifications for {selected_symbol} are missing or invalid.")
-    elif not result["live_quote"]:
+        result["notes"].append(f"Symbol specifications for {selected_symbol} are missing or invalid: {symbol_specs}.")
+    elif not live_quote:
         result["status"] = "NO_LIVE_TICK"
         result["notes"].append(f"No valid tick quote received for {selected_symbol}.")
-    elif not result["live_quote"].get("is_fresh"):
+    elif not live_quote.get("is_fresh"):
         result["status"] = "STALE_BROKER_QUOTE"
-        result["notes"].append(f"Broker quote latency ({result['live_quote']['latency_seconds']:.1f}s) exceeds 30.0s freshness limit.")
-    else:
+        result["notes"].append(f"Broker quote latency ({live_quote['latency_seconds']:.1f}s) exceeds 30.0s freshness limit.")
+    elif (
+        account_info.get("trade_mode_code") == 0
+        and account_info.get("trade_mode") == "DEMO"
+        and terminal_info.get("connected")
+        and live_quote.get("is_fresh")
+    ):
         result["status"] = "CONNECTED_DEMO_VERIFIED"
-        result["notes"].append(f"All pre-flight checks verified: Connected to DEMO account {result['account_info']['login']} with fresh quotes.")
+        result["notes"].append(f"All pre-flight checks verified: Connected to DEMO account {account_info['login']} with fresh quotes.")
+    else:
+        result["status"] = "VERIFICATION_FAILED"
+        result["notes"].append("Pre-flight safety checks could not be verified.")
 
     _mt5.shutdown()
     return result

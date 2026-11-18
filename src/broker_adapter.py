@@ -13,6 +13,8 @@ Supports:
 
 import csv
 import logging
+import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -149,23 +151,30 @@ class OctaBrokerAdapter:
         else:
             self.ledger_file = DEMO_LEDGER_CSV
 
+        self.open_positions_file = self.csv_file.with_name(self.csv_file.stem + "_open_positions.csv")
+        self._lock = threading.RLock()
+        self.is_ledger_corrupted: bool = False
+        self.ledger_quarantine_reason: str | None = None
+        self.is_positions_corrupted: bool = False
+        self.positions_quarantine_reason: str | None = None
         self.seen_event_ids: set[str] = set()
 
         self._init_ledger()
         self._init_csv()
+        self._init_open_positions()
         self._check_mt5_connection()
 
     def _init_ledger(self):
-        """Initializes or replays the durable append-only transaction ledger."""
+        """Initializes or replays the durable append-only transaction ledger with sequential verification."""
         self.ledger_file.parent.mkdir(parents=True, exist_ok=True)
         if not self.ledger_file.exists():
+            init_id = f"init_{int(time.time()*1000)}"
+            now_str = datetime.now(timezone.utc).isoformat()
             with open(self.ledger_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     "timestamp", "event_id", "event_type", "amount_usd", "balance_after_usd", "description"
                 ])
-                init_id = f"init_{int(time.time()*1000)}"
-                now_str = datetime.now(timezone.utc).isoformat()
                 writer.writerow([
                     now_str, init_id, "INITIAL_BALANCE", f"{self.initial_demo_equity:.2f}", f"{self.initial_demo_equity:.2f}", "Initial demo account balance"
                 ])
@@ -178,25 +187,54 @@ class OctaBrokerAdapter:
             self.equity = round(self.initial_demo_equity, 2)
         else:
             valid_events = 0
-            latest_balance = self.initial_demo_equity
+            running_balance: float | None = None
             try:
                 with open(self.ledger_file, "r", encoding="utf-8") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         event_id = row.get("event_id")
-                        if not event_id or event_id in self.seen_event_ids:
-                            continue
+                        if not event_id:
+                            self.is_ledger_corrupted = True
+                            self.ledger_quarantine_reason = f"Missing event_id in ledger row: {row}"
+                            break
+                        if event_id in self.seen_event_ids:
+                            self.is_ledger_corrupted = True
+                            self.ledger_quarantine_reason = f"Duplicate event ID in ledger: {event_id}"
+                            break
                         try:
-                            bal = float(row["balance_after_usd"])
-                            latest_balance = bal
-                            self.seen_event_ids.add(event_id)
-                            valid_events += 1
+                            amt = float(row["amount_usd"])
+                            bal_after = float(row["balance_after_usd"])
                         except (ValueError, KeyError) as parse_err:
-                            logger.warning("Corrupted or invalid ledger entry skipped (%s): %s", parse_err, row)
-                self.equity = round(latest_balance, 2)
-                logger.info("Restored demo account equity ($%.2f) from durable ledger (%d events).", self.equity, valid_events)
+                            self.is_ledger_corrupted = True
+                            self.ledger_quarantine_reason = f"Malformed numeric fields ({parse_err}) in row: {row}"
+                            break
+
+                        if running_balance is None:
+                            running_balance = round(amt, 2)
+                            if abs(bal_after - running_balance) > 0.005:
+                                self.is_ledger_corrupted = True
+                                self.ledger_quarantine_reason = f"Initial balance discrepancy: recorded {bal_after} != {running_balance}"
+                                break
+                        else:
+                            expected_bal = round(running_balance + amt, 2)
+                            if abs(bal_after - expected_bal) > 0.005:
+                                self.is_ledger_corrupted = True
+                                self.ledger_quarantine_reason = f"Balance continuity broken at event {event_id}: recorded {bal_after} != expected {expected_bal}"
+                                break
+                            running_balance = expected_bal
+
+                        self.seen_event_ids.add(event_id)
+                        valid_events += 1
+
+                if self.is_ledger_corrupted:
+                    logger.critical("LEDGER CORRUPTED AND QUARANTINED: %s", self.ledger_quarantine_reason)
+                else:
+                    self.equity = round(running_balance if running_balance is not None else self.initial_demo_equity, 2)
+                    logger.info("Restored demo account equity ($%.2f) from durable ledger (%d verified events).", self.equity, valid_events)
             except Exception as e:
-                logger.warning("Ledger read error: %s. Preserving current equity $%.2f", e, self.equity)
+                self.is_ledger_corrupted = True
+                self.ledger_quarantine_reason = f"Ledger read exception: {e}"
+                logger.critical("LEDGER CORRUPTED AND QUARANTINED: %s", self.ledger_quarantine_reason)
 
     def _init_csv(self):
         self.csv_file.parent.mkdir(parents=True, exist_ok=True)
@@ -239,100 +277,217 @@ class OctaBrokerAdapter:
             except Exception as e:
                 logger.warning("Could not restore closed positions from CSV: %s", e)
 
+    def _init_open_positions(self):
+        """Initializes and restores open paper positions across process restarts."""
+        self.open_positions.clear()
+        if not self.open_positions_file.exists():
+            return
+
+        try:
+            with open(self.open_positions_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ticket = row.get("ticket")
+                    if not ticket:
+                        continue
+                    try:
+                        pos = BrokerPosition(
+                            ticket=ticket,
+                            symbol=row.get("symbol", self.symbol),
+                            side=row.get("side", "BUY"),
+                            lots=float(row.get("lots", 0.01)),
+                            open_price=float(row.get("open_price", 0.0)),
+                            open_time=row.get("open_time", ""),
+                            sl=float(row.get("sl", 0.0)),
+                            tp1=float(row.get("tp1", 0.0)),
+                            tp2=float(row.get("tp2", 0.0)),
+                            be_active=(str(row.get("be_active", "False")).strip().lower() in ("true", "1")),
+                            status="OPEN",
+                            execution_type="PAPER_SIMULATION",
+                        )
+                        if pos.open_price <= 0 or pos.lots <= 0:
+                            raise ValueError(f"Invalid open position values: price={pos.open_price}, lots={pos.lots}")
+                        self.open_positions[ticket] = pos
+                    except Exception as parse_err:
+                        self.is_positions_corrupted = True
+                        self.positions_quarantine_reason = f"Corrupted open position row: {parse_err} in {row}"
+                        logger.critical("OPEN POSITIONS QUARANTINED: %s", self.positions_quarantine_reason)
+                        break
+            if not self.is_positions_corrupted and self.open_positions:
+                logger.info("Restored %d active open positions from disk (%s).", len(self.open_positions), self.open_positions_file)
+        except Exception as e:
+            self.is_positions_corrupted = True
+            self.positions_quarantine_reason = f"Open positions read failure: {e}"
+            logger.critical("OPEN POSITIONS QUARANTINED: %s", self.positions_quarantine_reason)
+
+    def _save_open_positions(self):
+        """Atomically saves all active open positions to disk via temp file replacement."""
+        self.open_positions_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = self.open_positions_file.with_suffix(".tmp")
+        try:
+            with open(tmp_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "ticket", "symbol", "side", "lots", "open_price", "open_time",
+                    "sl", "tp1", "tp2", "be_active", "status", "execution_type"
+                ])
+                for pos in self.open_positions.values():
+                    writer.writerow([
+                        pos.ticket, pos.symbol, pos.side, f"{pos.lots:.2f}", f"{pos.open_price:.2f}",
+                        pos.open_time, f"{pos.sl:.2f}", f"{pos.tp1:.2f}", f"{pos.tp2:.2f}",
+                        str(pos.be_active), pos.status, "PAPER_SIMULATION"
+                    ])
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp_file, self.open_positions_file)
+        except Exception as exc:
+            logger.error("Failed to persist open positions to disk: %s", exc)
+            raise
+
     def record_deposit(self, amount: float, reason: str = "Deposit", event_id: str | None = None) -> float:
         """
         Explicitly records an auditable capital deposit or adjustment and persists to disk.
+        Writes to ledger before updating in-memory state. Thread-safe. Idempotent on event_id.
         """
-        if amount <= 0:
-            raise ValueError(f"Deposit amount must be positive, got {amount}")
+        with self._lock:
+            e_id = event_id or f"dep_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+            if e_id in self.seen_event_ids:
+                logger.info("Deposit event %s already processed. Skipping duplicate.", e_id)
+                return self.equity
 
-        e_id = event_id or f"dep_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-        if e_id in self.seen_event_ids:
-            logger.info("Deposit event %s already processed. Skipping duplicate.", e_id)
+            if self.is_ledger_corrupted:
+                raise RuntimeError(f"Cannot record deposit: Ledger is quarantined ({self.ledger_quarantine_reason})")
+
+            if amount <= 0:
+                raise ValueError(f"Deposit amount must be positive, got {amount}")
+
+            new_equity = round(self.equity + amount, 2)
+            now_str = datetime.now(timezone.utc).isoformat()
+
+            # Atomic write relative to in-memory state: write to disk FIRST
+            with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    now_str, e_id, "DEPOSIT", f"{amount:.2f}", f"{new_equity:.2f}", reason
+                ])
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+            # Mutate state only after disk write succeeds
+            self.equity = new_equity
+            self.seen_event_ids.add(e_id)
+            logger.info("Auditable deposit recorded: +$%.2f (%s) [ID: %s]. New equity: $%.2f", amount, reason, e_id, self.equity)
             return self.equity
-
-        self.equity = round(self.equity + amount, 2)
-        now_str = datetime.now(timezone.utc).isoformat()
-        with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                now_str, e_id, "DEPOSIT", f"{amount:.2f}", f"{self.equity:.2f}", reason
-            ])
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        self.seen_event_ids.add(e_id)
-        logger.info("Auditable deposit recorded: +$%.2f (%s) [ID: %s]. New equity: $%.2f", amount, reason, e_id, self.equity)
-        return self.equity
 
     def record_withdrawal(self, amount: float, reason: str = "Withdrawal", event_id: str | None = None) -> float:
         """
         Explicitly records an auditable capital withdrawal and persists to disk.
+        Writes to ledger before updating in-memory state. Thread-safe. Idempotent on event_id.
         Rejects overdrafts.
         """
-        if amount <= 0:
-            raise ValueError(f"Withdrawal amount must be positive, got {amount}")
-        if amount > self.equity:
-            raise ValueError(f"Withdrawal amount (${amount:.2f}) exceeds current equity (${self.equity:.2f})")
+        with self._lock:
+            e_id = event_id or f"wth_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+            if e_id in self.seen_event_ids:
+                logger.info("Withdrawal event %s already processed. Skipping duplicate.", e_id)
+                return self.equity
 
-        e_id = event_id or f"wth_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-        if e_id in self.seen_event_ids:
-            logger.info("Withdrawal event %s already processed. Skipping duplicate.", e_id)
+            if self.is_ledger_corrupted:
+                raise RuntimeError(f"Cannot record withdrawal: Ledger is quarantined ({self.ledger_quarantine_reason})")
+
+            if amount <= 0:
+                raise ValueError(f"Withdrawal amount must be positive, got {amount}")
+            if amount > self.equity:
+                raise ValueError(f"Withdrawal amount (${amount:.2f}) exceeds current equity (${self.equity:.2f})")
+
+            new_equity = round(self.equity - amount, 2)
+            now_str = datetime.now(timezone.utc).isoformat()
+
+            # Atomic write relative to in-memory state: write to disk FIRST
+            with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    now_str, e_id, "WITHDRAWAL", f"-{amount:.2f}", f"{new_equity:.2f}", reason
+                ])
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+            # Mutate state only after disk write succeeds
+            self.equity = new_equity
+            self.seen_event_ids.add(e_id)
+            logger.info("Auditable withdrawal recorded: -$%.2f (%s) [ID: %s]. New equity: $%.2f", amount, reason, e_id, self.equity)
             return self.equity
-
-        self.equity = round(self.equity - amount, 2)
-        now_str = datetime.now(timezone.utc).isoformat()
-        with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                now_str, e_id, "WITHDRAWAL", f"-{amount:.2f}", f"{self.equity:.2f}", reason
-            ])
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        self.seen_event_ids.add(e_id)
-        logger.info("Auditable withdrawal recorded: -$%.2f (%s) [ID: %s]. New equity: $%.2f", amount, reason, e_id, self.equity)
-        return self.equity
 
     def reconcile_ledger(self) -> tuple[bool, float, str]:
         """
-        Reconstructs balance from scratch by replaying all valid events in the durable ledger CSV.
-        Verifies reconciliation against in-memory self.equity.
+        Reconstructs balance from scratch by sequentially replaying and verifying all events in the durable ledger CSV.
+        Verifies arithmetic continuity and checks against in-memory self.equity.
         """
-        if not self.ledger_file.exists():
-            return False, 0.0, "Ledger file does not exist"
+        with self._lock:
+            if self.is_ledger_corrupted:
+                return False, self.equity, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
 
-        computed_balance = 0.0
-        seen_ids = set()
-        first_row = True
-        try:
-            with open(self.ledger_file, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    e_id = row.get("event_id")
-                    if not e_id or e_id in seen_ids:
-                        continue
-                    try:
-                        amt = float(row["amount_usd"])
-                        if first_row:
-                            computed_balance = amt
-                            first_row = False
+            if not self.ledger_file.exists():
+                return False, 0.0, "Ledger file does not exist"
+
+            computed_balance: float | None = None
+            seen_ids = set()
+            try:
+                with open(self.ledger_file, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        e_id = row.get("event_id")
+                        if not e_id:
+                            self.is_ledger_corrupted = True
+                            self.ledger_quarantine_reason = f"Missing event_id in ledger row: {row}"
+                            return False, computed_balance or 0.0, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
+                        if e_id in seen_ids:
+                            self.is_ledger_corrupted = True
+                            self.ledger_quarantine_reason = f"Duplicate event_id in ledger file: {e_id}"
+                            return False, computed_balance or 0.0, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
+                        try:
+                            amt = float(row["amount_usd"])
+                            bal_after = float(row["balance_after_usd"])
+                        except (ValueError, KeyError) as parse_err:
+                            self.is_ledger_corrupted = True
+                            self.ledger_quarantine_reason = f"Malformed numeric fields ({parse_err}) in row: {row}"
+                            return False, computed_balance or 0.0, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
+
+                        if computed_balance is None:
+                            computed_balance = round(amt, 2)
+                            if abs(bal_after - computed_balance) > 0.005:
+                                self.is_ledger_corrupted = True
+                                self.ledger_quarantine_reason = f"Initial balance mismatch: recorded {bal_after} != computed {computed_balance}"
+                                return False, computed_balance, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
                         else:
-                            computed_balance = round(computed_balance + amt, 2)
+                            expected_bal = round(computed_balance + amt, 2)
+                            if abs(bal_after - expected_bal) > 0.005:
+                                self.is_ledger_corrupted = True
+                                self.ledger_quarantine_reason = f"Balance continuity broken at event {e_id}: recorded {bal_after} != expected {expected_bal}"
+                                return False, computed_balance, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
+                            computed_balance = expected_bal
                         seen_ids.add(e_id)
-                    except (ValueError, KeyError):
-                        continue
-            discrepancy = round(abs(self.equity - computed_balance), 2)
-            if discrepancy < 0.01:
-                return True, self.equity, "RECONCILED_OK"
-            else:
-                return False, computed_balance, f"Discrepancy: in-memory ${self.equity:.2f} != ledger ${computed_balance:.2f}"
-        except Exception as e:
-            return False, self.equity, f"Reconciliation exception: {e}"
+
+                final_bal = round(computed_balance if computed_balance is not None else self.initial_demo_equity, 2)
+                discrepancy = round(abs(self.equity - final_bal), 2)
+                if discrepancy < 0.01:
+                    return True, self.equity, "RECONCILED_OK"
+                else:
+                    self.is_ledger_corrupted = True
+                    self.ledger_quarantine_reason = f"Discrepancy: in-memory ${self.equity:.2f} != ledger ${final_bal:.2f}"
+                    return False, final_bal, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
+            except Exception as e:
+                self.is_ledger_corrupted = True
+                self.ledger_quarantine_reason = f"Reconciliation exception: {e}"
+                return False, self.equity, f"QUARANTINED_CORRUPTED_LEDGER: {self.ledger_quarantine_reason}"
 
     def get_ledger_history(self) -> list[dict]:
         """Returns all recorded transactions from the durable ledger."""
@@ -393,160 +548,182 @@ class OctaBrokerAdapter:
         tp1: float,
         tp2: float,
     ) -> BrokerPosition | None:
-        """Executes a broker order with spread and slippage modeling. Rejects invalid volume."""
-        if lots < self.min_lot:
-            logger.warning("Order execution REJECTED: requested volume %.4f is below broker minimum %.2f.", lots, self.min_lot)
-            return None
+        """Executes a paper order with spread and slippage modeling. Rejects invalid volume or quarantined state."""
+        with self._lock:
+            if self.is_ledger_corrupted or self.is_positions_corrupted:
+                logger.critical(
+                    "Order execution BLOCKED: Adapter in quarantined state (ledger_corrupted=%s, positions_corrupted=%s)",
+                    self.is_ledger_corrupted, self.is_positions_corrupted
+                )
+                return None
 
-        quote = self.get_symbol_quote(current_price)
-        
-        # Real execution prices: BUY at Ask, SELL at Bid + realistic 50ms slippage (+0.05 pt)
-        slippage = 0.05
-        if side == "BUY":
-            fill_price = round(quote["ask"] + slippage, 2)
-        else:
-            fill_price = round(quote["bid"] - slippage, 2)
+            if lots < self.min_lot:
+                logger.warning("Order execution REJECTED: requested volume %.4f is below broker minimum %.2f.", lots, self.min_lot)
+                return None
 
-        ticket = f"OCTA_{int(time.time())}_{uuid.uuid4().hex[:5]}"
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            quote = self.get_symbol_quote(current_price)
+            
+            # Real execution prices: BUY at Ask, SELL at Bid + realistic 50ms slippage (+0.05 pt)
+            slippage = 0.05
+            if side == "BUY":
+                fill_price = round(quote["ask"] + slippage, 2)
+            else:
+                fill_price = round(quote["bid"] - slippage, 2)
 
-        execution_type = "BROKER_DEMO_MT5" if self.is_mt5_live else "PAPER_SIMULATION"
-        pos = BrokerPosition(
-            ticket=ticket,
-            symbol=self.symbol,
-            side=side,
-            lots=round(lots, 2),
-            open_price=fill_price,
-            open_time=now_str,
-            sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            be_active=False,
-            status="OPEN",
-            execution_type=execution_type,
-        )
-        self.open_positions[ticket] = pos
-        if self.is_mt5_live:
-            logger.info("[BROKER_DEMO_MT5] GENUINE MT5 DEMO FILL: %s %s %.2f lots @ %.2f (SL: %.2f, TP1: %.2f)", ticket, side, pos.lots, fill_price, sl, tp1)
-        else:
+            ticket = f"OCTA_{int(time.time())}_{uuid.uuid4().hex[:5]}"
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            # Mandate: OctaBrokerAdapter is strictly PAPER_SIMULATION.
+            # Simulated execution must NEVER be labeled as BROKER_DEMO_MT5.
+            pos = BrokerPosition(
+                ticket=ticket,
+                symbol=self.symbol,
+                side=side,
+                lots=round(lots, 2),
+                open_price=fill_price,
+                open_time=now_str,
+                sl=sl,
+                tp1=tp1,
+                tp2=tp2,
+                be_active=False,
+                status="OPEN",
+                execution_type="PAPER_SIMULATION",
+            )
+            self.open_positions[ticket] = pos
+            self._save_open_positions()
             logger.info("[PAPER_SIMULATION] SHADOW PAPER FILL: %s %s %.2f lots @ %.2f (SL: %.2f, TP1: %.2f)", ticket, side, pos.lots, fill_price, sl, tp1)
-        return pos
+            return pos
 
     def on_tick(self, high: float, low: float, close: float) -> list[str]:
         """Evaluates open positions tick-by-tick against real High and Low."""
-        events = []
-        for ticket, pos in list(self.open_positions.items()):
-            if pos.status != "OPEN":
-                continue
+        with self._lock:
+            if self.is_ledger_corrupted or self.is_positions_corrupted:
+                logger.critical("on_tick BLOCKED: Adapter in quarantined state.")
+                return ["VETO: Adapter in quarantined state"]
 
-            entry = pos.open_price
-            side = pos.side
-            lots = pos.lots
-            tp1 = pos.tp1
-            sl = pos.sl
-            risk_dist = abs(entry - sl)
-            one_R = max(0.50, risk_dist * lots * self.contract_size)
-            be_dist = max(risk_dist * 0.75, 3.50)
+            events = []
+            open_positions_changed = False
+            for ticket, pos in list(self.open_positions.items()):
+                if pos.status != "OPEN":
+                    continue
 
-            closed = False
-            close_price = close
-            reason = ""
-            pnl_usd = 0.0
-            pnl_pips = 0.0
-            pnl_R = 0.0
+                entry = pos.open_price
+                side = pos.side
+                lots = pos.lots
+                tp1 = pos.tp1
+                sl = pos.sl
+                risk_dist = abs(entry - sl)
+                one_R = max(0.50, risk_dist * lots * self.contract_size)
+                be_dist = max(risk_dist * 0.75, 3.50)
 
-            was_be_active = pos.be_active
-            eval_sl = pos.sl
+                closed = False
+                close_price = close
+                reason = ""
+                pnl_usd = 0.0
+                pnl_pips = 0.0
+                pnl_R = 0.0
 
-            if side == "BUY":
-                # Check stop loss against active stop at start of candle (conservative: if both SL and TP hit, SL assumed first)
-                if low <= eval_sl and high >= tp1:
-                    closed = True
-                    close_price = eval_sl - 0.05  # exit slippage
-                    reason = "STOP_LOSS (Conservative)"
-                elif low <= eval_sl:
-                    closed = True
-                    close_price = eval_sl - 0.05
-                    reason = "BREAK_EVEN" if was_be_active else "STOP_LOSS"
-                elif high >= tp1:
-                    closed = True
-                    close_price = tp1 - 0.05
-                    reason = "TAKE_PROFIT_1"
-                elif not pos.be_active and high >= entry + be_dist:
-                    # Break-Even activated for SUBSEQUENT candles/ticks; cannot trigger exit on this same candle
-                    pos.be_active = True
-                    pos.sl = entry
-                    events.append(f"🔒 {pos.ticket} (BUY) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
+                was_be_active = pos.be_active
+                eval_sl = pos.sl
+
+                if side == "BUY":
+                    # Check stop loss against active stop at start of candle (conservative: if both SL and TP hit, SL assumed first)
+                    if low <= eval_sl and high >= tp1:
+                        closed = True
+                        close_price = eval_sl - 0.05  # exit slippage
+                        reason = "STOP_LOSS (Conservative)"
+                    elif low <= eval_sl:
+                        closed = True
+                        close_price = eval_sl - 0.05
+                        reason = "BREAK_EVEN" if was_be_active else "STOP_LOSS"
+                    elif high >= tp1:
+                        closed = True
+                        close_price = tp1 - 0.05
+                        reason = "TAKE_PROFIT_1"
+                    elif not pos.be_active and high >= entry + be_dist:
+                        # Break-Even activated for SUBSEQUENT candles/ticks; cannot trigger exit on this same candle
+                        pos.be_active = True
+                        pos.sl = entry
+                        open_positions_changed = True
+                        events.append(f"🔒 {pos.ticket} (BUY) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
+
+                    if closed:
+                        pnl_usd = round((close_price - entry) * lots * self.contract_size, 2)
+                        pnl_pips = round((close_price - entry) * 10.0, 1)
+                        pnl_R = round(pnl_usd / max(0.01, one_R), 3)
+
+                else:  # SELL
+                    if high >= eval_sl and low <= tp1:
+                        closed = True
+                        close_price = eval_sl + 0.05
+                        reason = "STOP_LOSS (Conservative)"
+                    elif high >= eval_sl:
+                        closed = True
+                        close_price = eval_sl + 0.05
+                        reason = "BREAK_EVEN" if was_be_active else "STOP_LOSS"
+                    elif low <= tp1:
+                        closed = True
+                        close_price = tp1 + 0.05
+                        reason = "TAKE_PROFIT_1"
+                    elif not pos.be_active and low <= entry - be_dist:
+                        pos.be_active = True
+                        pos.sl = entry
+                        open_positions_changed = True
+                        events.append(f"🔒 {pos.ticket} (SELL) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
+
+                    if closed:
+                        pnl_usd = round((entry - close_price) * lots * self.contract_size, 2)
+                        pnl_pips = round((entry - close_price) * 10.0, 1)
+                        pnl_R = round(pnl_usd / max(0.01, one_R), 3)
 
                 if closed:
-                    pnl_usd = round((close_price - entry) * lots * self.contract_size, 2)
-                    pnl_pips = round((close_price - entry) * 10.0, 1)
-                    pnl_R = round(pnl_usd / max(0.01, one_R), 3)
+                    pos.status = "CLOSED"
+                    pos.close_price = close_price
+                    pos.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    pos.close_reason = reason
+                    pos.pnl_usd = pnl_usd
+                    pos.pnl_pips = pnl_pips
+                    pos.pnl_R = pnl_R
 
-            else:  # SELL
-                if high >= eval_sl and low <= tp1:
-                    closed = True
-                    close_price = eval_sl + 0.05
-                    reason = "STOP_LOSS (Conservative)"
-                elif high >= eval_sl:
-                    closed = True
-                    close_price = eval_sl + 0.05
-                    reason = "BREAK_EVEN" if was_be_active else "STOP_LOSS"
-                elif low <= tp1:
-                    closed = True
-                    close_price = tp1 + 0.05
-                    reason = "TAKE_PROFIT_1"
-                elif not pos.be_active and low <= entry - be_dist:
-                    pos.be_active = True
-                    pos.sl = entry
-                    events.append(f"🔒 {pos.ticket} (SELL) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
+                    new_equity = round(self.equity + pnl_usd, 2)
 
-                if closed:
-                    pnl_usd = round((entry - close_price) * lots * self.contract_size, 2)
-                    pnl_pips = round((entry - close_price) * 10.0, 1)
-                    pnl_R = round(pnl_usd / max(0.01, one_R), 3)
+                    # Persist transaction to durable ledger FIRST before mutating in-memory equity
+                    pnl_event_id = f"pnl_{ticket}"
+                    if pnl_event_id not in self.seen_event_ids:
+                        with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                pos.close_time, pnl_event_id, "TRADE_CLOSED_PNL", f"{pnl_usd:.2f}", f"{new_equity:.2f}", f"{pos.execution_type} {pos.side} {pos.lots}L {ticket} ({reason})"
+                            ])
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except Exception:
+                                pass
+                        self.seen_event_ids.add(pnl_event_id)
 
-            if closed:
-                pos.status = "CLOSED"
-                pos.close_price = close_price
-                pos.close_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                pos.close_reason = reason
-                pos.pnl_usd = pnl_usd
-                pos.pnl_pips = pnl_pips
-                pos.pnl_R = pnl_R
-                self.equity = round(self.equity + pnl_usd, 2)
+                    self.equity = new_equity
 
-                # Persist to CSV
-                with open(self.csv_file, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        pos.ticket, pos.open_time, pos.close_time, pos.symbol, pos.side,
-                        pos.lots, pos.open_price, pos.close_price, pos.sl, pos.tp1, pos.tp2,
-                        pos.pnl_usd, pos.pnl_pips, pos.pnl_R, pos.close_reason, self.equity, pos.execution_type
-                    ])
-
-                # Persist transaction to durable ledger
-                pnl_event_id = f"pnl_{ticket}"
-                if pnl_event_id not in self.seen_event_ids:
-                    with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+                    # Persist to closed CSV
+                    with open(self.csv_file, "a", newline="", encoding="utf-8") as f:
                         writer = csv.writer(f)
                         writer.writerow([
-                            pos.close_time, pnl_event_id, "TRADE_CLOSED_PNL", f"{pnl_usd:.2f}", f"{self.equity:.2f}", f"{pos.execution_type} {pos.side} {pos.lots}L {ticket} ({reason})"
+                            pos.ticket, pos.open_time, pos.close_time, pos.symbol, pos.side,
+                            pos.lots, pos.open_price, pos.close_price, pos.sl, pos.tp1, pos.tp2,
+                            pos.pnl_usd, pos.pnl_pips, pos.pnl_R, pos.close_reason, self.equity, pos.execution_type
                         ])
-                        f.flush()
-                        try:
-                            os.fsync(f.fileno())
-                        except Exception:
-                            pass
-                    self.seen_event_ids.add(pnl_event_id)
 
-                del self.open_positions[ticket]
-                self.closed_positions.append(pos)
-                events.append(
-                    f"🏁 [{pos.execution_type}] {pos.ticket} CLOSED: {pos.side} @ {close_price:.2f} | Reason: {reason} | PnL: ${pnl_usd:+.2f} ({pnl_pips:+.1f} pips, {pnl_R:+.2f}R) | Equity: ${self.equity:.2f}"
-                )
+                    del self.open_positions[ticket]
+                    open_positions_changed = True
+                    self.closed_positions.append(pos)
+                    events.append(
+                        f"🏁 [{pos.execution_type}] {pos.ticket} CLOSED: {pos.side} @ {close_price:.2f} | Reason: {reason} | PnL: ${pnl_usd:+.2f} ({pnl_pips:+.1f} pips, {pnl_R:+.2f}R) | Equity: ${self.equity:.2f}"
+                    )
 
-        return events
+            if open_positions_changed:
+                self._save_open_positions()
+
+            return events
 
     def get_performance_summary(self) -> dict:
         total = len(self.closed_positions)

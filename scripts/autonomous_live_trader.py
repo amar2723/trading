@@ -220,11 +220,30 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     curr_hour = last_ts.hour
 
     # Upgrade 1: True Causal Higher-Timeframe (H1) Trend from completed bars
+    m5_is_broker_spot = bool(df["is_broker_spot"].iloc[-1]) if "is_broker_spot" in df.columns else False
+    m5_source = str(df["data_source"].iloc[-1]) if "data_source" in df.columns else "UNKNOWN"
+
     df_h1 = None
     try:
-        df_h1 = fetch_live_candles("XAUUSD", "H1", 50)
+        df_h1 = fetch_live_candles("XAUUSD", "H1", 50, require_broker_spot=m5_is_broker_spot)
     except Exception as e:
         logger.warning("H1 causal fetch note: %s", e)
+
+    h1_source = str(df_h1["data_source"].iloc[-1]) if (df_h1 is not None and not df_h1.empty and "data_source" in df_h1.columns) else "UNAVAILABLE"
+    h1_is_broker_spot = bool(df_h1["is_broker_spot"].iloc[-1]) if (df_h1 is not None and not df_h1.empty and "is_broker_spot" in df_h1.columns) else False
+
+    # Multi-Timeframe Source & Provenance Alignment Check
+    timeframe_mismatch = False
+    timeframe_mismatch_reason = ""
+    if df_h1 is None or df_h1.empty:
+        timeframe_mismatch = True
+        timeframe_mismatch_reason = "BLOCKED_H1_FEED_UNAVAILABLE"
+    elif m5_source != h1_source:
+        timeframe_mismatch = True
+        timeframe_mismatch_reason = f"BLOCKED_TIMEFRAME_SOURCE_MISMATCH (M5: {m5_source} vs H1: {h1_source})"
+    elif m5_is_broker_spot != h1_is_broker_spot:
+        timeframe_mismatch = True
+        timeframe_mismatch_reason = f"BLOCKED_TIMEFRAME_PROVENANCE_MISMATCH (M5 spot: {m5_is_broker_spot} vs H1 spot: {h1_is_broker_spot})"
 
     # Compute all indicators causally via shared feature pipeline
     df_proc = compute_indicator_dataframe(df, df_h1=df_h1)
@@ -267,7 +286,40 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     is_broker_spot = bool(df["is_broker_spot"].iloc[-1]) if "is_broker_spot" in df.columns else False
     data_source = str(df["data_source"].iloc[-1]) if "data_source" in df.columns else "UNKNOWN"
 
-    if chosen_sig is None or chosen_sig.action == "HOLD":
+    if not (is_broker_spot and data_source == "BROKER_MT5_SPOT"):
+        # STRICT SAFETY VETO: Live trading execution prohibited on non-broker data
+        action = "HOLD"
+        entry = current_price
+        sl = current_price
+        tp1 = current_price
+        tp2 = current_price
+        be_trigger = current_price
+        risk_dist = 0.0
+        strat_prefix = chosen_sig.strategy_name if (chosen_sig and chosen_sig.action != "HOLD") else "HOLD"
+        active_strategy = f"{strat_prefix} (BLOCKED_NON_BROKER_DATA)"
+        confidence = 0.0
+        why = (
+            f"• 1. HOLD: Execution strictly prohibited on non-broker data source '{data_source}'.\n"
+            "• 2. Verified broker spot feed (BROKER_MT5_SPOT) is required for live execution.\n"
+            "• 3. Web proxy or futures data (GC=F) is restricted to non-executing background monitoring."
+        )
+    elif timeframe_mismatch:
+        action = "HOLD"
+        entry = current_price
+        sl = current_price
+        tp1 = current_price
+        tp2 = current_price
+        be_trigger = current_price
+        risk_dist = 0.0
+        strat_prefix = chosen_sig.strategy_name if (chosen_sig and chosen_sig.action != "HOLD") else "HOLD"
+        active_strategy = f"{strat_prefix} ({timeframe_mismatch_reason})"
+        confidence = 0.0
+        why = (
+            f"• 1. HOLD: Execution strictly prohibited due to timeframe data mismatch: {timeframe_mismatch_reason}.\n"
+            "• 2. Both M5 and H1 feeds must belong to the exact same verified broker spot source.\n"
+            "• 3. Combining disparate sources (e.g. M5 spot with H1 futures) is blocked to guarantee analytical validity."
+        )
+    elif chosen_sig is None or chosen_sig.action == "HOLD":
         action = "HOLD"
         entry = current_price
         sl = current_price
@@ -283,22 +335,6 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             f"• 3. Risk Guard: Capital strictly preserved on sidelines (0 risk exposure).\n"
             f"• 4. Indicators: RSI at {rsi_val:.1f} (Neutral/Wait), Buyer Flow {buyer_pct}% vs {seller_pct}%.\n"
             f"• 5. Action: Standing by for high-probability H1 EMA 20/50 test."
-        )
-    elif not (is_broker_spot and data_source == "BROKER_MT5_SPOT"):
-        # STRICT SAFETY VETO: Live trading execution prohibited on non-broker data
-        action = "HOLD"
-        entry = current_price
-        sl = current_price
-        tp1 = current_price
-        tp2 = current_price
-        be_trigger = current_price
-        risk_dist = 0.0
-        active_strategy = f"{chosen_sig.strategy_name} (BLOCKED_NON_BROKER_DATA)"
-        confidence = 0.0
-        why = (
-            f"• 1. HOLD: Execution strictly prohibited on non-broker data source '{data_source}'.\n"
-            "• 2. Verified broker spot feed (BROKER_MT5_SPOT) is required for live execution.\n"
-            "• 3. Risk Guard: Capital strictly preserved on sidelines (0 risk exposure)."
         )
     else:
         action = chosen_sig.action

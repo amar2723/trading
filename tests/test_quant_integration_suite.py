@@ -335,8 +335,10 @@ def test_forming_candle_rejection():
 
 
 # 12. Test Elimination of Silent Account-Equity Resets
-def test_no_silent_equity_resets():
-    adapter = OctaBrokerAdapter(initial_demo_equity=40.68)
+def test_no_silent_equity_resets(tmp_path):
+    trades_file = tmp_path / "test_trades.csv"
+    ledger_file = tmp_path / "test_ledger.csv"
+    adapter = OctaBrokerAdapter(initial_demo_equity=40.68, csv_file=trades_file, ledger_file=ledger_file)
     adapter.equity = 7.42
     # Verify equity is not silently bumped back to 40.68
     assert adapter.get_account_equity() == 7.42
@@ -443,6 +445,10 @@ def test_durable_ledger_persistence_and_reconciliation(tmp_path):
     with pytest.raises(ValueError):
         adapter.record_withdrawal(500.00, "Overdraft Withdrawal")
 
+    # Idempotent withdrawal event must return equity without overdraft check
+    res_dup_wth = adapter.record_withdrawal(500.00, "Overdraft Duplicate", event_id="wth_001")
+    assert res_dup_wth == 120.68
+
     # Step 6: Verify ledger reconciliation
     reconciled, bal, msg = adapter.reconcile_ledger()
     assert reconciled is True
@@ -457,17 +463,29 @@ def test_durable_ledger_persistence_and_reconciliation(tmp_path):
     )
     # Balance must be perfectly reconstructed from the append-only ledger
     assert adapter_restarted.get_account_equity() == 120.68
+    assert adapter_restarted.is_ledger_corrupted is False
 
-    # Step 8: Handle corrupted ledger row safely without crashing
+    # Step 8: Quarantine corrupted/tampered ledger instead of silently trusting or certifying it
+    # Append a row where balance_after breaks arithmetic continuity
     with open(ledger_file, "a", encoding="utf-8") as f:
-        f.write("corrupted_timestamp,corrupt_id,UNKNOWN,not_a_number,also_corrupt,corrupted_desc\n")
+        f.write("2026-11-18T12:00:00Z,tamper_001,DEPOSIT,50.00,9999.00,Tampered Row\n")
 
-    adapter_resilient = OctaBrokerAdapter(
+    adapter_tampered = OctaBrokerAdapter(
         initial_demo_equity=40.68,
         csv_file=trades_file,
         ledger_file=ledger_file,
     )
-    assert adapter_resilient.get_account_equity() == 120.68
+    assert adapter_tampered.is_ledger_corrupted is True
+    reconciled, bal, msg = adapter_tampered.reconcile_ledger()
+    assert reconciled is False
+    assert "QUARANTINED_CORRUPTED_LEDGER" in msg
+
+    # Further operations on quarantined adapter must be blocked
+    with pytest.raises(RuntimeError):
+        adapter_tampered.record_deposit(10.0, "Blocked Deposit")
+    with pytest.raises(RuntimeError):
+        adapter_tampered.record_withdrawal(10.0, "Blocked Withdrawal")
+    assert adapter_tampered.execute_order("BUY", 0.01, 2600.0, 2595.0, 2610.0, 2615.0) is None
 
 
 # 16. Test Mocked MT5 Connected Diagnostic Paths
@@ -475,17 +493,19 @@ def test_mt5_diagnostic_mocked_scenarios():
     class MockMT5:
         def __init__(
             self,
-            trade_mode=0,  # 0=DEMO, 2=REAL
+            trade_mode=0,  # 0=DEMO, 1=CONTEST, 2=REAL
             connected=True,
             quote_age_sec=5.0,
             missing_account=False,
             invalid_specs=False,
+            currency="USD",
         ):
             self.trade_mode = trade_mode
             self.connected = connected
             self.quote_age_sec = quote_age_sec
             self.missing_account = missing_account
             self.invalid_specs = invalid_specs
+            self.currency = currency
 
         def initialize(self, *args, **kwargs):
             return True
@@ -515,7 +535,7 @@ def test_mt5_diagnostic_mocked_scenarios():
                     "login": 8839201,
                     "trade_mode": self.trade_mode,
                     "server": "OctaFX-Demo",
-                    "currency": "USD",
+                    "currency": self.currency,
                     "balance": 1000.0,
                     "equity": 1000.0,
                     "margin_free": 1000.0,
@@ -527,11 +547,12 @@ def test_mt5_diagnostic_mocked_scenarios():
 
         def symbol_info(self, symbol):
             if self.invalid_specs:
-                return type("SymbolInfo", (), {"_asdict": lambda s: {"digits": 2, "point": 0.01, "trade_contract_size": 0.0, "volume_min": 0.01}})()
+                return type("SymbolInfo", (), {"_asdict": lambda s: {"digits": 2, "point": 0.01, "trade_contract_size": 0.0, "trade_tick_size": 0.01, "volume_min": 0.01, "volume_step": 0.01}})()
             return type("SymbolInfo", (), {
                 "_asdict": lambda s: {
                     "digits": 2,
                     "point": 0.01,
+                    "trade_tick_size": 0.01,
                     "trade_contract_size": 100.0,
                     "volume_min": 0.01,
                     "volume_step": 0.01,
@@ -560,6 +581,7 @@ def test_mt5_diagnostic_mocked_scenarios():
     res_demo = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_demo)
     assert res_demo["status"] == "CONNECTED_DEMO_VERIFIED"
     assert res_demo["account_info"]["trade_mode"] == "DEMO"
+    assert res_demo["account_info"]["trade_mode_code"] == 0
     assert res_demo["live_quote"]["is_fresh"] is True
     assert res_demo["live_quote"]["spread_usd"] == 0.42
     assert res_demo["live_quote"]["spread_pips"] == 4.2
@@ -570,24 +592,113 @@ def test_mt5_diagnostic_mocked_scenarios():
     assert res_real["status"] == "BLOCKED_REAL_ACCOUNT"
     assert "safety veto: real-money" in res_real["notes"][-1].lower()
 
-    # Scenario 3: Stale broker quote (> 30 seconds old)
+    # Scenario 3: CONTEST account must be explicitly BLOCKED (cannot pass as DEMO)
+    mock_contest = MockMT5(trade_mode=1, connected=True)
+    res_contest = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_contest)
+    assert res_contest["status"] == "BLOCKED_CONTEST_ACCOUNT"
+    assert "contest" in res_contest["notes"][-1].lower()
+
+    # Scenario 4: Unknown trade mode must be BLOCKED
+    mock_unknown = MockMT5(trade_mode=99, connected=True)
+    res_unknown = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_unknown)
+    assert res_unknown["status"] == "BLOCKED_NON_DEMO_ACCOUNT"
+
+    # Scenario 5: Missing currency must be rejected
+    mock_no_curr = MockMT5(trade_mode=0, connected=True, currency="")
+    res_no_curr = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_no_curr)
+    assert res_no_curr["status"] == "INVALID_ACCOUNT_CURRENCY"
+
+    # Scenario 6: Stale broker quote (> 30 seconds old)
     mock_stale = MockMT5(trade_mode=0, connected=True, quote_age_sec=45.0)
     res_stale = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_stale)
     assert res_stale["status"] == "STALE_BROKER_QUOTE"
     assert res_stale["live_quote"]["is_fresh"] is False
 
-    # Scenario 4: Missing / not logged in account
+    # Scenario 7: Missing / not logged in account
     mock_no_acc = MockMT5(missing_account=True)
     res_no_acc = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_no_acc)
     assert res_no_acc["status"] == "NO_ACCOUNT_LOGGED_IN"
 
-    # Scenario 5: Invalid symbol specs
+    # Scenario 8: Invalid symbol specs
     mock_bad_specs = MockMT5(invalid_specs=True)
     res_bad_specs = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_bad_specs)
     assert res_bad_specs["status"] == "INVALID_SYMBOL_SPECS"
 
 
-# 17. Test SpreadQuote Property Aliases
+# 17. Test Open Paper Positions Persistence and Recovery Across Restarts
+def test_open_paper_positions_persistence_and_recovery(tmp_path):
+    trades_file = tmp_path / "octa_test_trades.csv"
+    ledger_file = tmp_path / "octa_test_ledger.csv"
+
+    # Adapter 1 opens a position
+    adapter1 = OctaBrokerAdapter(initial_demo_equity=1000.0, csv_file=trades_file, ledger_file=ledger_file)
+    pos = adapter1.execute_order("BUY", 0.02, 2600.0, sl=2595.0, tp1=2615.0, tp2=2625.0)
+    assert pos is not None
+    assert pos.execution_type == "PAPER_SIMULATION"
+    ticket = pos.ticket
+    assert ticket in adapter1.open_positions
+
+    # Trigger BE move on candle high
+    adapter1.on_tick(high=2604.5, low=2599.0, close=2603.0)
+    assert adapter1.open_positions[ticket].be_active is True
+    assert adapter1.open_positions[ticket].sl == pos.open_price
+
+    # Adapter 2 simulates process restart
+    adapter2 = OctaBrokerAdapter(initial_demo_equity=1000.0, csv_file=trades_file, ledger_file=ledger_file)
+    assert ticket in adapter2.open_positions
+    recovered_pos = adapter2.open_positions[ticket]
+    assert recovered_pos.ticket == ticket
+    assert recovered_pos.side == "BUY"
+    assert recovered_pos.lots == 0.02
+    assert recovered_pos.open_price == pos.open_price
+    assert recovered_pos.be_active is True
+    assert recovered_pos.sl == pos.open_price
+    assert recovered_pos.execution_type == "PAPER_SIMULATION"
+
+    # Close the trade on Adapter 2 via TP1 hit
+    events = adapter2.on_tick(high=2616.0, low=2601.0, close=2615.0)
+    assert ticket not in adapter2.open_positions
+    assert len(adapter2.closed_positions) == 1
+    assert adapter2.closed_positions[0].status == "CLOSED"
+    assert adapter2.closed_positions[0].execution_type == "PAPER_SIMULATION"
+
+    # Adapter 3 simulates second restart after closure
+    adapter3 = OctaBrokerAdapter(initial_demo_equity=1000.0, csv_file=trades_file, ledger_file=ledger_file)
+    assert len(adapter3.open_positions) == 0
+    assert len(adapter3.closed_positions) == 1
+
+
+# 18. Test Multi-Timeframe Feed Mismatch Failsafe
+def test_multi_timeframe_feed_mismatch_failsafe():
+    from scripts.autonomous_live_trader import analyze_with_6_master_upgrades, ProductionRuntimeManager
+
+    mgr = ProductionRuntimeManager()
+
+    # Create M5 candles labeled as BROKER_MT5_SPOT
+    m5_bars = 50
+    m5_closes = [2600.0 + (0.5 if i % 2 == 0 else -0.5) for i in range(m5_bars - 1)] + [2635.0]
+    df_m5_spot = pd.DataFrame({
+        "timestamp": pd.date_range("2026-11-18 10:00", periods=m5_bars, freq="5min"),
+        "open": [2600.0] * m5_bars,
+        "high": [c + 1.0 for c in m5_closes],
+        "low": [c - 1.0 for c in m5_closes],
+        "close": m5_closes,
+        "volume": [100.0] * m5_bars,
+        "tick_volume": [100.0] * m5_bars,
+        "data_source": ["BROKER_MT5_SPOT"] * m5_bars,
+        "is_broker_spot": [True] * m5_bars,
+        "is_futures_proxy": [False] * m5_bars,
+    })
+
+    # When H1 is fetched via default environment (MT5 off -> Yahoo GC=F futures proxy)
+    # The source mismatch (M5 BROKER_MT5_SPOT vs H1 YAHOO_GC_F_FUTURES_PROXY or UNAVAILABLE) must trigger HOLD!
+    setup = analyze_with_6_master_upgrades(df_m5_spot, mgr)
+    assert setup["action"] == "HOLD"
+    assert "BLOCKED_TIMEFRAME" in setup["strategy"] or "BLOCKED_H1_FEED_UNAVAILABLE" in setup["strategy"]
+    assert setup["risk_approved"] is False
+
+
+# 19. Test SpreadQuote Property Aliases
 def test_spread_quote_property_aliases():
     q = SpreadQuote.from_bid_ask(
         bid=2600.00,
