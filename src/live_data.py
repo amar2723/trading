@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import time
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -118,8 +119,9 @@ def validate_candle_dataframe(
     if age_minutes < -5.0:
         return False, f"Future timestamp detected: candle closure is {-age_minutes:.1f} min in the future."
 
-    if age_minutes > max_age_minutes:
-        return False, f"Stale candles: latest bar closed {age_minutes:.1f} min ago (max allowed: {max_age_minutes:.1f} min)."
+    effective_max_age = max(max_age_minutes, tf_minutes * 1.5)
+    if age_minutes > effective_max_age:
+        return False, f"Stale candles: latest bar closed {age_minutes:.1f} min ago (max allowed: {effective_max_age:.1f} min for {timeframe})."
 
     return True, "OK"
 
@@ -185,7 +187,14 @@ def fetch_live_candles(
                     rates = mt5.copy_rates_from_pos(symbol, tf, 1, bars)
                     if rates is not None and len(rates) > 0:
                         df = pd.DataFrame(rates)
-                        df["timestamp"] = pd.to_datetime(df["time"], unit="s", utc=True).tz_localize(None)
+                        now_ts = time.time()
+                        # Use broker tick time to determine server timezone offset (e.g. EET / UTC+2)
+                        tick = mt5.symbol_info_tick(symbol)
+                        if tick is not None and getattr(tick, "time", 0) > 0:
+                            server_offset_sec = round((tick.time - now_ts) / 3600.0) * 3600
+                        else:
+                            server_offset_sec = 0
+                        df["timestamp"] = pd.to_datetime(df["time"] - server_offset_sec, unit="s", utc=True).dt.tz_localize(None)
                         df = df.rename(columns={"tick_volume": "volume"})
                         df["tick_volume"] = df["volume"]
                         df["data_source"] = "BROKER_MT5_SPOT"
