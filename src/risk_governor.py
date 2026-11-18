@@ -50,7 +50,15 @@ class RiskGovernor:
         open_positions_count: int = 0,
         daily_loss_R: float = 0.0,
         is_reconciled: bool = True,
+        session_hour: int | None = None,
     ) -> RiskApproval:
+        # Check 0: Asian Session Chop Shield
+        if session_hour is not None and 0 <= session_hour <= 6:
+            return RiskApproval(
+                approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
+                veto_reason="VETO: Asian Session Chop Shield active (00:00-06:00 UTC). Empirical win rate < 20% in low-liquidity hours."
+            )
+
         # Check 1: Reconciliation integrity
         if not is_reconciled:
             return RiskApproval(
@@ -99,6 +107,16 @@ class RiskGovernor:
         # Check if broker minimum 0.01 lot exceeds permitted risk on small accounts
         actual_risk_usd = round(calculated_lot * pip_cost_per_lot, 2)
         actual_risk_pct = round((actual_risk_usd / max(1.0, equity)) * 100.0, 2)
+
+        # STRICT 1.0% MAXIMUM RISK CEILING VETO
+        if actual_risk_pct > self.max_risk_pct:
+            return RiskApproval(
+                approved=False,
+                lot_size=0.0,
+                risk_usd=actual_risk_usd,
+                risk_pct=actual_risk_pct,
+                veto_reason=f"VETO: Minimum position (0.01 lot) risk (${actual_risk_usd:.2f} / {actual_risk_pct:.1f}%) exceeds maximum {self.max_risk_pct:.1f}% risk limit (${max_loss_usd:.2f}). Undercapitalized for 0.01 lot."
+            )
 
         return RiskApproval(
             approved=True,

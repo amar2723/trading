@@ -42,6 +42,12 @@ from src.risk_governor import RiskGovernor
 from src.signal_journal import SignalJournal
 from src.broker_adapter import OctaBrokerAdapter
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -306,94 +312,76 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         except Exception as e:
             logger.warning("Ensemble note: %s", e)
 
-    # High-Accuracy Confluence Direction Engine (Accurate Setup Formulation)
-    risk_dist = round(max(atr_val * 1.25, 3.20), 2)  # Tight 32-45 pip risk buffer
+    # Phase 2 Strategy Layer Evaluation (Deterministic Entry Engines)
+    df_h1_data = df_h1 if 'df_h1' in locals() and df_h1 is not None else None
+    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df, df_h1_data)
+    sig_donchian = DonchianBreakoutStrategy.evaluate(df, df_h1_data)
+    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df, df_h1_data)
 
-    # Multi-factor score
-    long_score = 0
-    short_score = 0
-
-    if current_price > ema_20:
-        long_score += 2
-    else:
-        short_score += 2
-
-    if is_strong_bull:
-        long_score += 2
-    elif is_strong_bear:
-        short_score += 2
-
-    if buyer_pct > seller_pct:
-        long_score += 2
-    else:
-        short_score += 2
-
-    if sweep_low_confirmed or (current_price <= recent_low_20 + 2.0 and rsi_val <= 40.0):
-        long_score += 3
-    if sweep_high_confirmed or (current_price >= recent_high_20 - 2.0 and rsi_val >= 60.0):
-        short_score += 3
-
-    # RSI overbought/oversold protections
-    if rsi_val >= 70.0:
-        long_score -= 4
-    if rsi_val <= 30.0:
-        short_score -= 4
-
-    if long_score >= short_score:
-        action = "BUY"
-        entry = round(current_price, 2)
-        sl = round(entry - risk_dist, 2)
-        risk = max(entry - sl, 2.50)
-        tp1 = round(entry + (risk * 1.5), 2)
-        tp2 = round(entry + (risk * 2.8), 2)
-        be_trigger = round(entry + 2.00, 2)
-        confidence = min(95.0, max(82.0, round(ml_confidence + 4.0, 1)))
-        why = (
-            f"• 1. Structure: Bullish Alignment (EMA 20 > EMA 50, RSI {rsi_val:.1f} Safe).\n"
-            f"• 2. Confluence: Order Flow Dominance (🟢 {buyer_pct}% Buyers vs 🔴 {seller_pct}% Sellers).\n"
-            f"• 3. Session: Active in `{session_name}`.\n"
-            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
-            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
-        )
-    else:
-        action = "SELL"
-        entry = round(current_price, 2)
-        sl = round(entry + risk_dist, 2)
-        risk = max(sl - entry, 2.50)
-        tp1 = round(entry - (risk * 1.5), 2)
-        tp2 = round(entry - (risk * 2.8), 2)
-        be_trigger = round(entry - 2.00, 2)
-        confidence = min(95.0, max(82.0, round(ml_confidence + 4.0, 1)))
-        why = (
-            f"• 1. Structure: Bearish Exhaustion/Rejection (EMA 20 < EMA 50, RSI {rsi_val:.1f} Safe).\n"
-            f"• 2. Confluence: Seller Flow Dominance (🔴 {seller_pct}% Sellers vs 🟢 {buyer_pct}% Buyers).\n"
-            f"• 3. Session: Active in `{session_name}`.\n"
-            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
-            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
-        )
-
-    # Phase 2 Strategy Layer Evaluation
-    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df, df_h1 if 'df_h1' in locals() and df_h1 is not None else None)
-    sig_donchian = DonchianBreakoutStrategy.evaluate(df)
-    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df)
-
-    active_strategy = "H1_TREND_PULLBACK"
+    # Strategy Priority: 1. Value Pullback (Highest Expectancy) -> 2. Breakout -> 3. Squeeze
+    chosen_sig = None
     if sig_pullback.action != "HOLD":
-        active_strategy = sig_pullback.strategy_name
+        chosen_sig = sig_pullback
     elif sig_donchian.action != "HOLD":
-        active_strategy = sig_donchian.strategy_name
+        chosen_sig = sig_donchian
     elif sig_squeeze.action != "HOLD":
-        active_strategy = sig_squeeze.strategy_name
+        chosen_sig = sig_squeeze
 
-    # Phase 2 ML Meta-Filter Expected R Evaluation
-    ml_verdict = meta_filter.evaluate_candidate(action, df, h1_trend_bias, h1_dist_ema50)
+    if chosen_sig is None or chosen_sig.action == "HOLD":
+        action = "HOLD"
+        entry = current_price
+        sl = current_price
+        tp1 = current_price
+        tp2 = current_price
+        be_trigger = current_price
+        risk_dist = 0.0
+        active_strategy = "WAITING_FOR_PULLBACK (HOLD)"
+        confidence = 50.0
+        why = (
+            f"• 1. Structure: Market in {regime} | {session_name}.\n"
+            f"• 2. Strategy Verdict: No clean H1 value pullback or breakout confirmed.\n"
+            f"• 3. Risk Guard: Capital strictly preserved on sidelines (0 risk exposure).\n"
+            f"• 4. Indicators: RSI at {rsi_val:.1f} (Neutral/Wait), Buyer Flow {buyer_pct}% vs {seller_pct}%.\n"
+            f"• 5. Action: Standing by for high-probability H1 EMA 20/50 test."
+        )
+    else:
+        action = chosen_sig.action
+        entry = chosen_sig.entry
+        sl = chosen_sig.sl
+        tp1 = chosen_sig.tp1
+        tp2 = chosen_sig.tp2
+        be_trigger = chosen_sig.be_trigger
+        risk_dist = chosen_sig.risk_pips / 10.0
+        active_strategy = chosen_sig.strategy_name
+        confidence = round(ml_confidence, 1)
+        why = (
+            f"• 1. Strategy Engine: `{active_strategy}` ({chosen_sig.action}).\n"
+            f"• 2. Rationale: {chosen_sig.rationale}\n"
+            f"• 3. Session: Active in `{session_name}`.\n"
+            f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
+            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
+        )
 
-    # Phase 2 Risk Governor Review
+    # Phase 2 ML Meta-Filter Expected R Evaluation (Strict +0.15R Hurdle with spread/slip cost drag)
+    ml_verdict = meta_filter.evaluate_candidate(
+        candidate_action=action,
+        strategy_name=active_strategy,
+        df_m5=df,
+        h1_trend_bias=h1_trend_bias,
+        h1_dist_ema50=h1_dist_ema50,
+        risk_usd=max(1.0, risk_dist * 1.0),
+        min_expected_R=0.15,
+    )
+    if action != "HOLD":
+        confidence = round(ml_verdict.predicted_win_prob * 100, 1)
+
+    # Phase 2 Risk Governor Review (with Asian Session Chop Shield)
     risk_approval = risk_governor.review_trade(
         equity=broker.equity,
         risk_pips=risk_dist * 10,
         current_spread_pips=24.0,
         open_positions_count=len(broker.open_positions),
+        session_hour=curr_hour,
     )
 
     return {
@@ -429,6 +417,23 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
 
 
 def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str:
+    if setup["action"] == "HOLD":
+        return (
+            f"⏸️ *MARKET CONSOLIDATION (HOLD)*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 *Asset*: XAUUSD (Gold - M5 Live)\n"
+            f"💵 *Live Market Price*: `${setup['price']:.2f}`\n"
+            f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n\n"
+            f"🛡️ *Capital Preservation Mode Active*\n"
+            f"• No high-probability pullback or breakout confirmed.\n"
+            f"• Risk Governor status: Standing down (0 active exposure).\n"
+            f"• ML Meta-Filter: ABSTAIN (Waiting for high-expectancy setup).\n"
+            f"• Indicators: RSI at `{setup.get('rsi', 50.0)}` | Volume: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n\n"
+            f"{setup['why']}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 *Commands*: `/trade` | `/demo` | `/status` | `/audit`"
+        )
+
     icon = "🔴" if setup["action"] == "SELL" else "🟢"
     lot_disp = setup.get("lot_size", 0.01) if setup.get("lot_size", 0.0) > 0 else 0.01
     risk_usd_disp = setup.get("risk_usd", 0.50) if setup.get("risk_usd", 0.0) > 0 else 0.50
@@ -452,14 +457,47 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"🚦 *Risk Governor*: {risk_status_disp}\n"
         f"📈 *Broker Audited Win Rate*: `{setup['win_rate']}%` ({setup.get('win_count', 0)}W / {setup.get('loss_count', 0)}L)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 *6-PILLAR INSTITUTIONAL ANALYSIS*:\n"
+        f"📊 *INSTITUTIONAL ANALYSIS*:\n"
         f"{setup['why']}\n"
         f"• *Signed Volume Proxy*: 🟢 {setup['buyer_pct']}% Buyers vs 🔴 {setup['seller_pct']}% Sellers\n"
-        f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,685 M5 Bars)\n"
+        f"• *Model Version*: Dual XGBoost + LightGBM (Causal H1 Aligned, 13,792 M5 Bars)\n"
         f"• *Execution Engine*: Octa Shadow Broker (Floating Spread & 50ms Slippage)\n"
         f"• *Signal Journal*: Logged to `reports/signal_journal.jsonl`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💡 *Commands*: `/trade` | `/demo` | `/status` | `/audit` | `/end` | `/start`"
+    )
+
+
+def format_telemetry_pulse(setup: dict, broker: OctaBrokerAdapter, mgr: ProductionRuntimeManager) -> str:
+    active_pos = list(broker.open_positions.values())
+    if active_pos:
+        pos = active_pos[0]
+        cur_p = setup["price"]
+        pips = (cur_p - pos.open_price) * 10 if pos.side == "BUY" else (pos.open_price - cur_p) * 10
+        pos_str = f"⚡ *ACTIVE {pos.side}*: `{pos.lots} lots @ ${pos.open_price:.2f}` ({pips:+.1f} pips | TP: ${pos.tp1:.2f} | SL: ${pos.sl:.2f})"
+    else:
+        pos_str = "🛡️ *POSITION*: Flat (0 Exposure - Capital Preserved)"
+
+    pred_dir = setup.get("action", "HOLD")
+    strategy = setup.get("strategy", "H1_TREND_PULLBACK")
+    ml_dec = setup.get("ml_decision", "ABSTAIN")
+    exp_r = setup.get("ml_expected_R", 0.0)
+    win_p = setup.get("ml_win_prob", 0.45) * 100
+
+    bias_icon = "🟢" if pred_dir == "BUY" else ("🔴" if pred_dir == "SELL" else "⏸️")
+
+    return (
+        f"🛰️ *XAUUSD LIVE TELEMETRY (30s PULSE)*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 *Live Gold*: `${setup['price']:.2f}`\n"
+        f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n"
+        f"{bias_icon} *AI Model Bias*: `{pred_dir}` via `{strategy}`\n"
+        f"🧠 *ML Filter*: `{ml_dec}` (Prob: `{win_p:.1f}%`, E[R]: `{exp_r:+.2f}R`)\n"
+        f"🌊 *Order Flow*: 🟢 `{setup['buyer_pct']}%` vs 🔴 `{setup['seller_pct']}%` | RSI: `{setup.get('rsi', 50.0)}`\n"
+        f"{pos_str}\n"
+        f"📈 *Verified Accuracy*: `{mgr.state.get('win_rate_pct', 0.0)}%` ({mgr.state.get('wins', 0)}W / {mgr.state.get('losses', 0)}L)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 Commands: `/trade` (Instant setup) | `/end` (Pause alerts)"
     )
 
 
@@ -652,7 +690,8 @@ def run_24_7_service():
                         continue
 
                     last_row = df.iloc[-1]
-                    current_candle_time = str(last_row["timestamp"])
+                    # Canonical 5-minute bar time (floored to clean 5min boundary)
+                    candle_bar_time = pd.to_datetime(last_row["timestamp"]).floor("5min").strftime("%Y-%m-%d %H:%M:00")
                     current_close = float(last_row["close"])
 
                     # 1. Evaluate Octa Broker Tick Events (Fills, BE, TP, SL)
@@ -668,9 +707,8 @@ def run_24_7_service():
                                 signal_id=ev.split()[1] if len(ev.split()) > 1 else "unknown",
                                 outcome="WIN" if "TAKE_PROFIT" in ev else ("BREAK_EVEN" if "BREAK_EVEN" in ev else "LOSS"),
                                 exit_price=current_close,
-                                pnl_pips=0.0,
-                                pnl_R=0.0,
-                                exit_timestamp=str(last_row["timestamp"]),
+                                net_pnl_usd=0.0,
+                                net_R=0.0,
                             )
 
                     # 2. Check Legacy Prediction Outcomes (TP, SL, Break-Even)
@@ -693,45 +731,36 @@ def run_24_7_service():
                     if mgr.is_alerts_enabled():
                         setup = analyze_with_6_master_upgrades(df, mgr)
 
-                        # Dispatch Master Trade Card on candle close or significant shift
-                        should_alert = current_candle_time != mgr.state.get("last_alerted_candle")
-                        if should_alert and setup["confidence"] >= 75.0:
-                            suppress_alert = False
-                            for t in mgr.state.get("pending_trades", []):
-                                if t.get("status") == "OPEN" and t.get("action") == setup["action"]:
-                                    if setup["action"] == "BUY" and current_close < t["entry"] - 1.5:
-                                        suppress_alert = True
-                                        logger.info("Suppressed duplicate BUY: Active BUY underwater.")
-                                        break
-                                    elif setup["action"] == "SELL" and current_close > t["entry"] + 1.5:
-                                        suppress_alert = True
-                                        logger.info("Suppressed duplicate SELL: Active SELL underwater.")
-                                        break
+                        # Strictly trigger at most ONCE per closed 5-minute candle
+                        should_alert = candle_bar_time != mgr.state.get("last_alerted_candle")
+                        if should_alert:
+                            # 1. Always log decision to immutable Signal Journal for complete audit trail
+                            sig_id = signal_journal.log_signal_decision(
+                                strategy_name=setup.get("strategy", "H1_TREND_PULLBACK"),
+                                action=setup["action"],
+                                entry=setup["entry"],
+                                sl=setup["sl"],
+                                tp1=setup["tp1"],
+                                tp2=setup["tp2"],
+                                risk_pips=setup.get("risk_pips", 45.0),
+                                predicted_win_prob=setup.get("ml_win_prob", 0.45),
+                                expected_R=setup.get("ml_expected_R", 0.10),
+                                ml_decision=setup.get("ml_decision", "TAKE"),
+                                risk_approved=setup.get("risk_approved", True),
+                                risk_lot_size=setup.get("lot_size", 0.01),
+                                risk_usd=setup.get("risk_usd", 0.50),
+                                veto_reason=setup.get("risk_veto"),
+                                bar_timestamp=candle_bar_time,
+                            )
 
-                            if not suppress_alert:
-                                sig_id = signal_journal.log_signal_decision(
-                                    strategy_name=setup.get("strategy", "H1_TREND_PULLBACK"),
-                                    action=setup["action"],
-                                    entry=setup["entry"],
-                                    sl=setup["sl"],
-                                    tp1=setup["tp1"],
-                                    tp2=setup["tp2"],
-                                    risk_pips=setup.get("risk_pips", 35.0),
-                                    predicted_win_prob=setup.get("ml_win_prob", 0.45),
-                                    expected_R=setup.get("ml_expected_R", 0.10),
-                                    ml_decision=setup.get("ml_decision", "TAKE"),
-                                    risk_approved=setup.get("risk_approved", True),
-                                    risk_lot_size=setup.get("lot_size", 0.01),
-                                    risk_usd=setup.get("risk_usd", 0.50),
-                                    veto_reason=setup.get("risk_veto"),
-                                    bar_timestamp=setup["time"],
-                                )
+                            # 2. Gating: ONLY dispatch to Telegram & broker execute if BOTH ML filter and Risk Governor approve AND action != HOLD!
+                            is_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE" and setup["action"] != "HOLD"
+                            if is_actionable:
                                 card = format_card(setup, "24/7 MASTER AI SIGNAL")
                                 for cid in list(subscribers):
                                     robust_send_telegram(token, cid, card)
-                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], current_candle_time, setup["confidence"], setup["rsi"])
-                                executed_pos = None
-                                if setup.get("risk_approved") and len(broker.open_positions) == 0:
+                                mgr.record_prediction(setup["action"], setup["entry"], setup["sl"], setup["tp1"], setup["tp2"], candle_bar_time, setup["confidence"], setup["rsi"])
+                                if len(broker.open_positions) == 0:
                                     executed_pos = broker.execute_order(
                                         side=setup["action"],
                                         lots=setup.get("lot_size", 0.01),
@@ -742,7 +771,20 @@ def run_24_7_service():
                                     )
                                     if executed_pos:
                                         logger.info("Octa Shadow Demo executed order %s (%s %.2f lots @ %.2f)", executed_pos.ticket, setup["action"], executed_pos.lots, executed_pos.open_price)
-                                logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%)", setup["action"], sig_id, setup["price"], setup["confidence"])
+                                logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%, E[R]: +%.2fR)", setup["action"], sig_id, setup["price"], setup["confidence"], setup.get("ml_expected_R", 0.0))
+                            else:
+                                veto_reason = setup.get("risk_veto") or f"ML E[R] ({setup.get('ml_expected_R', 0.0):+.2f}R) below hurdle (+0.15R)"
+                                logger.info("Bar %s Filtered: ML=%s, Risk=%s. [Decision: HOLD]", candle_bar_time, setup.get("ml_decision"), veto_reason)
+
+                            mgr.state["last_alerted_candle"] = candle_bar_time
+                            mgr.save_state()
+
+                        # 3. Continuous ~30s Telemetry Pulse (Sends ~2 notifications per minute so user sees real-time AI tracking)
+                        if not (should_alert and is_actionable):
+                            pulse_card = format_telemetry_pulse(setup, broker, mgr)
+                            for cid in list(subscribers):
+                                robust_send_telegram(token, cid, pulse_card)
+                            logger.info("Dispatched 30s live telemetry pulse to %d subscriber(s) (Gold: $%.2f, Bias: %s)", len(subscribers), setup["price"], setup["action"])
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)

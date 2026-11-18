@@ -15,4 +15,5 @@ scratch/
 models/*.pkl
 !models/xauusd_master_ensemble.pkl
 models/*.joblib
+catboost_info/
 .streamlit/secrets.toml
