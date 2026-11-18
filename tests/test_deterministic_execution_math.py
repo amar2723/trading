@@ -88,12 +88,90 @@ def test_zero_auto_bump_on_sub_minimum_or_gap_risk():
     assert len(adapter.open_positions) == 0
 
     # 2. Risk Governor: If equity is $400.00, 1.0% risk budget is $4.00.
-    # A $4.50 stop loss + $0.34 friction risks $4.84 > $4.00.
+    # A $4.50 stop loss + $0.52 friction risks $5.02 > $4.00.
     # Must reject and NOT round up to 0.01 lot.
-    app = gov.review_trade(equity=400.00, risk_pips=45.0, current_spread_pips=24.0, session_hour=14)
+    app = gov.review_trade(equity=400.00, stop_dist_usd=4.50, spread_price_usd=0.42, session_hour=14)
     assert app.approved is False
     assert app.lot_size == 0.0
     assert "undercapitalized" in app.veto_reason.lower()
+
+
+def test_exact_monetary_risk_sizing_across_equities():
+    """
+    Priority 0 Verification:
+    Tests exact monetary-risk sizing and capital protection across account equities:
+    $40.68, $100.00, $450.00, $500.00, and $1,000.00.
+    Parameters:
+    - Typical Octa gold spread: $0.42 / oz (4.2 pips)
+    - Round-trip slippage: $0.10 / oz ($0.05 entry + $0.05 exit)
+    - Contract size: 100 oz / standard lot
+    - Base stop loss distance: $4.50 / oz
+    - Friction per oz: $0.42 + $0.10 = $0.52 / oz
+    - Total loss per 0.01 lot: 1 oz * ($4.50 + $0.52) = $5.02
+    Rules:
+    - NO accepted trade may EVER exceed 1.0% modeled initial risk.
+    - Zero volume auto-bumping: undercapitalized accounts must be rejected with 0.00 lots.
+    """
+    gov = RiskGovernor(max_risk_pct=1.0, contract_size=100.0, round_trip_slippage_usd=0.10)
+
+    # 1. Equity: $40.68 (Initial demo account)
+    # 1.0% risk budget = $0.41. Min lot risk = $5.02 (12.34% of equity).
+    app_40 = gov.review_trade(equity=40.68, stop_dist_usd=4.50, spread_price_usd=0.42, session_hour=14)
+    assert app_40.approved is False
+    assert app_40.lot_size == 0.0
+    assert app_40.risk_usd == 5.02
+    assert app_40.risk_pct == 12.34
+    assert "undercapitalized" in app_40.veto_reason.lower()
+
+    # 2. Equity: $100.00
+    # 1.0% risk budget = $1.00. Min lot risk = $5.02 (5.02% of equity).
+    app_100 = gov.review_trade(equity=100.00, stop_dist_usd=4.50, spread_price_usd=0.42, session_hour=14)
+    assert app_100.approved is False
+    assert app_100.lot_size == 0.0
+    assert app_100.risk_usd == 5.02
+    assert app_100.risk_pct == 5.02
+    assert "undercapitalized" in app_100.veto_reason.lower()
+
+    # 3. Equity: $450.00
+    # 1.0% risk budget = $4.50. Min lot risk = $5.02 (1.12% of equity).
+    app_450 = gov.review_trade(equity=450.00, stop_dist_usd=4.50, spread_price_usd=0.42, session_hour=14)
+    assert app_450.approved is False
+    assert app_450.lot_size == 0.0
+    assert app_450.risk_usd == 5.02
+    assert app_450.risk_pct == 1.12
+    assert "undercapitalized" in app_450.veto_reason.lower()
+
+    # 4. Equity: $500.00
+    # 1.0% risk budget = $5.00.
+    # At stop_dist = $4.50, total loss is $5.02 > $5.00 -> MUST REJECT (strict <= 1.0% ceiling)
+    app_500_strict = gov.review_trade(equity=500.00, stop_dist_usd=4.50, spread_price_usd=0.42, session_hour=14)
+    assert app_500_strict.approved is False
+    assert app_500_strict.lot_size == 0.0
+    assert app_500_strict.risk_usd == 5.02
+    assert app_500_strict.risk_pct == 1.00  # 1.004% rounded to 1.00%
+    # If stop distance is tightened to $4.40 ($4.40 + $0.52 = $4.92 <= $5.00 budget):
+    app_500_approved = gov.review_trade(equity=500.00, stop_dist_usd=4.40, spread_price_usd=0.42, session_hour=14)
+    assert app_500_approved.approved is True
+    assert app_500_approved.lot_size == 0.01
+    assert app_500_approved.risk_usd == 4.92
+    assert app_500_approved.risk_pct == 0.98
+    assert app_500_approved.risk_pct <= 1.0
+
+    # 5. Equity: $1,000.00
+    # 1.0% risk budget = $10.00.
+    # At stop_dist = $4.50 ($502 loss per standard lot):
+    # Raw lots = 10.00 / 502.00 = 0.01992 -> Quantizes to 0.01 lots.
+    # 0.01 lot risk = $5.02 (0.50% of equity).
+    app_1000 = gov.review_trade(equity=1000.00, stop_dist_usd=4.50, spread_price_usd=0.42, session_hour=14)
+    assert app_1000.approved is True
+    assert app_1000.lot_size == 0.01
+    assert app_1000.risk_usd == 5.02
+    assert app_1000.risk_pct == 0.50
+    assert app_1000.risk_pct <= 1.0
+
+    # In every scenario: NO accepted trade breaches the 1.0% risk ceiling
+    for app in [app_500_approved, app_1000]:
+        assert app.risk_pct <= 1.0
 
 
 def test_event_driven_gap_risk_rejection():

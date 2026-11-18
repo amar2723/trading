@@ -101,21 +101,22 @@ def test_risk_governor_1pct_ceiling_and_sizing():
 
     # Case 1: $40.68 equity -> 1.0% = $0.41. Stop distance $4.50 -> risk $4.84 > $0.41
     # MUST BE VETOED, MUST NOT AUTO-BUMP TO 0.01 LOT
-    app_40 = gov.review_trade(equity=40.68, risk_pips=45.0, current_spread_pips=24.0, session_hour=14)
+    # Spread is $0.24 (2.4 pips). With authoritative spread_price_usd=0.24:
+    app_40 = gov.review_trade(equity=40.68, risk_pips=45.0, spread_price_usd=0.24, session_hour=14)
     assert app_40.approved is False
     assert app_40.lot_size == 0.0
     assert "undercapitalized" in app_40.veto_reason.lower()
 
     # Case 2: $100.00 equity -> 1.0% = $1.00. Risk $4.84 > $1.00
     # MUST BE VETOED
-    app_100 = gov.review_trade(equity=100.00, risk_pips=45.0, current_spread_pips=24.0, session_hour=14)
+    app_100 = gov.review_trade(equity=100.00, risk_pips=45.0, spread_price_usd=0.24, session_hour=14)
     assert app_100.approved is False
     assert app_100.lot_size == 0.0
 
     # Case 3: $450.00 equity -> 1.0% = $4.50.
     # Total risk with $0.24 spread + $0.10 slippage = $4.84 > $4.50
     # MUST BE VETOED because friction pushes total risk to 1.08% > 1.0%
-    app_450 = gov.review_trade(equity=450.00, risk_pips=45.0, current_spread_pips=24.0, session_hour=14)
+    app_450 = gov.review_trade(equity=450.00, risk_pips=45.0, spread_price_usd=0.24, session_hour=14)
     assert app_450.approved is False
     assert app_450.lot_size == 0.0
 
@@ -123,7 +124,7 @@ def test_risk_governor_1pct_ceiling_and_sizing():
     # Raw volume = 10.00 / 484.00 = 0.0206 -> lot_size = 0.02 lot
     # Actual risk = 0.02 * 484.00 = $9.68 (0.97% of equity <= 1.0%)
     # MUST BE APPROVED!
-    app_1000 = gov.review_trade(equity=1000.00, risk_pips=45.0, current_spread_pips=24.0, session_hour=14)
+    app_1000 = gov.review_trade(equity=1000.00, risk_pips=45.0, spread_price_usd=0.24, session_hour=14)
     assert app_1000.approved is True
     assert app_1000.lot_size == 0.02
     assert app_1000.risk_usd <= 10.00

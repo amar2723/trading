@@ -46,6 +46,11 @@ class RiskGovernor:
     6. Single concurrent position rule
     7. Daily drawdown circuit breaker (Max 2R loss / day)
     8. Asian session chop shield (00:00 - 06:00 UTC)
+
+    REAL-MARKET RISK DISCLOSURE:
+    While modeled initial stop-loss risk is strictly capped at <= 1.0%, real market conditions
+    (e.g., weekend price gaps, black-swan illiquidity, and fast-moving slippage) can cause
+    realized exit losses that exceed the modeled stop-loss budget during live market execution.
     """
 
     def __init__(
@@ -71,15 +76,17 @@ class RiskGovernor:
     def review_trade(
         self,
         equity: float,
-        risk_pips: float = 45.0,
+        risk_pips: float | None = None,
         stop_dist_usd: float | None = None,
         entry_price: float | None = None,
         sl_price: float | None = None,
-        current_spread_pips: float = 24.0,
+        spread_price_usd: float | None = None,
+        current_spread_pips: float | None = None,
         open_positions_count: int = 0,
         daily_loss_R: float = 0.0,
         is_reconciled: bool = True,
         session_hour: int | None = None,
+        spread_included_in_prices: bool = False,
     ) -> RiskApproval:
         # Check 0: Asian session chop shield (00:00 - 06:00 UTC)
         if session_hour is not None and 0 <= session_hour <= 6:
@@ -108,11 +115,24 @@ class RiskGovernor:
                 veto_reason=f"VETO: Active position limit ({open_positions_count}/{self.max_open_positions}) reached. No concurrent exposure."
             )
 
-        # Check 4: Spread constraint
-        if current_spread_pips > self.max_spread_pips:
+        # Check 4: Authoritative Monetary Spread Handling
+        # Standardized quotation: 1 point = $0.01; 1 pip = 10 points = $0.10 per ounce.
+        if spread_price_usd is not None and spread_price_usd >= 0:
+            spread_usd_per_oz = float(spread_price_usd)
+            spread_pips_val = round(spread_usd_per_oz / 0.10, 1)
+        elif current_spread_pips is not None and current_spread_pips >= 0:
+            spread_pips_val = float(current_spread_pips)
+            # Unified conversion: 1 pip = $0.10 price move per ounce
+            spread_usd_per_oz = round(spread_pips_val * 0.10, 4)
+        else:
+            # Default to verified Octa typical spread: 4.2 pips = $0.42/oz
+            spread_usd_per_oz = 0.42
+            spread_pips_val = 4.2
+
+        if spread_pips_val > self.max_spread_pips:
             return RiskApproval(
                 approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
-                veto_reason=f"VETO: Current spread ({current_spread_pips:.1f} pips) exceeds maximum allowed ({self.max_spread_pips:.1f} pips)."
+                veto_reason=f"VETO: Current spread ({spread_pips_val:.1f} pips / ${spread_usd_per_oz:.2f}) exceeds maximum allowed ({self.max_spread_pips:.1f} pips)."
             )
 
         # Check 5: Precise Stop Distance Determination
@@ -120,8 +140,8 @@ class RiskGovernor:
             dist_usd = abs(entry_price - sl_price)
         elif stop_dist_usd is not None and stop_dist_usd > 0:
             dist_usd = stop_dist_usd
-        elif risk_pips > 0:
-            dist_usd = risk_pips * 0.10  # 1 pip = $0.10 per ounce on standard XAUUSD quotes
+        elif risk_pips is not None and risk_pips > 0:
+            dist_usd = risk_pips * 0.10  # 1 pip = $0.10 per ounce on XAUUSD
         else:
             return RiskApproval(
                 approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
@@ -134,15 +154,27 @@ class RiskGovernor:
                 veto_reason="VETO: Stop loss distance too small (dist_usd <= $0.05)."
             )
 
-        # Execution friction modeling per ounce
-        # current_spread_pips in gold (e.g. 24.0 pips = $0.24/oz)
-        spread_usd_per_oz = current_spread_pips * 0.01
-        friction_usd_per_oz = spread_usd_per_oz + self.round_trip_slippage_usd
+        # Execution friction modeling per ounce (Double-Counting Prevention)
+        # If entry and SL are already priced with Ask/Bid spread, friction only includes slippage
+        if spread_included_in_prices:
+            friction_usd_per_oz = self.round_trip_slippage_usd
+        else:
+            friction_usd_per_oz = spread_usd_per_oz + self.round_trip_slippage_usd
 
         # Total monetary loss per 1.00 standard lot (100 oz) if stop loss is hit
         loss_per_lot_usd = self.contract_size * (dist_usd + friction_usd_per_oz)
 
-        # Maximum allowable risk budget in USD
+        # Optional MT5 broker verification when connected
+        if mt5 is not None:
+            try:
+                calc_pnl = mt5.order_calc_profit(0, "XAUUSD", 1.0, 2600.0, 2600.0 - dist_usd)
+                if calc_pnl is not None and calc_pnl < 0:
+                    broker_loss = abs(calc_pnl)
+                    loss_per_lot_usd = broker_loss + (self.contract_size * friction_usd_per_oz)
+            except Exception:
+                pass
+
+        # Maximum allowable risk budget in USD (Strict 1.0% limit)
         max_allowed_risk_usd = round(equity * (self.max_risk_pct / 100.0), 4)
 
         # Raw lot size that strictly respects the risk budget

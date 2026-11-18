@@ -22,6 +22,7 @@ from typing import Literal
 
 ROOT = Path(__file__).resolve().parents[1]
 DEMO_TRADES_CSV = ROOT / "reports/octa_demo_trades.csv"
+DEMO_LEDGER_CSV = ROOT / "reports/octa_account_ledger.csv"
 
 logger = logging.getLogger("BrokerAdapter")
 
@@ -60,6 +61,16 @@ class SpreadQuote:
 
     def __getitem__(self, key: str):
         return getattr(self, key)
+
+    @property
+    def spread_usd(self) -> float:
+        """Backwards-compatible alias for spread_price_usd."""
+        return self.spread_price_usd
+
+    @property
+    def quote_time(self) -> str:
+        """Backwards-compatible alias for time."""
+        return self.time
 
     @classmethod
     def from_bid_ask(
@@ -105,6 +116,7 @@ class BrokerPosition:
     pnl_usd: float = 0.0
     pnl_pips: float = 0.0
     pnl_R: float = 0.0
+    execution_type: Literal["PAPER_SIMULATION", "BROKER_DEMO_MT5"] = "PAPER_SIMULATION"
 
 
 class OctaBrokerAdapter:
@@ -117,9 +129,11 @@ class OctaBrokerAdapter:
         min_lot: float = 0.01,
         mode: Literal["AUTO", "MT5", "SHADOW_DEMO"] = "AUTO",
         csv_file: Path | str | None = None,
+        ledger_file: Path | str | None = None,
     ):
         self.symbol = symbol
-        self.equity = initial_demo_equity
+        self.initial_demo_equity = float(initial_demo_equity)
+        self.equity = float(initial_demo_equity)
         self.contract_size = contract_size
         self.lot_step = lot_step
         self.min_lot = min_lot
@@ -128,8 +142,61 @@ class OctaBrokerAdapter:
         self.open_positions: dict[str, BrokerPosition] = {}
         self.closed_positions: list[BrokerPosition] = []
         self.csv_file = Path(csv_file) if csv_file is not None else DEMO_TRADES_CSV
+        if ledger_file is not None:
+            self.ledger_file = Path(ledger_file)
+        elif csv_file is not None:
+            self.ledger_file = self.csv_file.with_name(self.csv_file.stem + "_ledger.csv")
+        else:
+            self.ledger_file = DEMO_LEDGER_CSV
+
+        self.seen_event_ids: set[str] = set()
+
+        self._init_ledger()
         self._init_csv()
         self._check_mt5_connection()
+
+    def _init_ledger(self):
+        """Initializes or replays the durable append-only transaction ledger."""
+        self.ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self.ledger_file.exists():
+            with open(self.ledger_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "event_id", "event_type", "amount_usd", "balance_after_usd", "description"
+                ])
+                init_id = f"init_{int(time.time()*1000)}"
+                now_str = datetime.now(timezone.utc).isoformat()
+                writer.writerow([
+                    now_str, init_id, "INITIAL_BALANCE", f"{self.initial_demo_equity:.2f}", f"{self.initial_demo_equity:.2f}", "Initial demo account balance"
+                ])
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            self.seen_event_ids.add(init_id)
+            self.equity = round(self.initial_demo_equity, 2)
+        else:
+            valid_events = 0
+            latest_balance = self.initial_demo_equity
+            try:
+                with open(self.ledger_file, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        event_id = row.get("event_id")
+                        if not event_id or event_id in self.seen_event_ids:
+                            continue
+                        try:
+                            bal = float(row["balance_after_usd"])
+                            latest_balance = bal
+                            self.seen_event_ids.add(event_id)
+                            valid_events += 1
+                        except (ValueError, KeyError) as parse_err:
+                            logger.warning("Corrupted or invalid ledger entry skipped (%s): %s", parse_err, row)
+                self.equity = round(latest_balance, 2)
+                logger.info("Restored demo account equity ($%.2f) from durable ledger (%d events).", self.equity, valid_events)
+            except Exception as e:
+                logger.warning("Ledger read error: %s. Preserving current equity $%.2f", e, self.equity)
 
     def _init_csv(self):
         self.csv_file.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +206,7 @@ class OctaBrokerAdapter:
                 writer.writerow([
                     "ticket", "open_time", "close_time", "symbol", "side", "lots",
                     "open_price", "close_price", "sl", "tp1", "tp2",
-                    "pnl_usd", "pnl_pips", "pnl_R", "close_reason", "account_equity"
+                    "pnl_usd", "pnl_pips", "pnl_R", "close_reason", "account_equity", "execution_type"
                 ])
         else:
             try:
@@ -166,24 +233,120 @@ class OctaBrokerAdapter:
                             pnl_usd=float(row.get("pnl_usd", 0.0)),
                             pnl_pips=float(row.get("pnl_pips", 0.0)),
                             pnl_R=float(row.get("pnl_R", 0.0)),
+                            execution_type=row.get("execution_type", "PAPER_SIMULATION"),
                         )
                         self.closed_positions.append(pos)
-                        if row.get("account_equity"):
-                            self.equity = float(row["account_equity"])
-                logger.info("Restored demo account equity ($%.2f) from ledger without silent reset.", self.equity)
             except Exception as e:
                 logger.warning("Could not restore closed positions from CSV: %s", e)
 
-    def record_deposit(self, amount: float, reason: str = "Deposit") -> float:
+    def record_deposit(self, amount: float, reason: str = "Deposit", event_id: str | None = None) -> float:
         """
-        Explicitly records an auditable capital deposit or adjustment.
-        Never resets equity silently.
+        Explicitly records an auditable capital deposit or adjustment and persists to disk.
         """
         if amount <= 0:
             raise ValueError(f"Deposit amount must be positive, got {amount}")
+
+        e_id = event_id or f"dep_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+        if e_id in self.seen_event_ids:
+            logger.info("Deposit event %s already processed. Skipping duplicate.", e_id)
+            return self.equity
+
         self.equity = round(self.equity + amount, 2)
-        logger.info("Auditable account deposit: +$%.2f (%s). New equity: $%.2f", amount, reason, self.equity)
+        now_str = datetime.now(timezone.utc).isoformat()
+        with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now_str, e_id, "DEPOSIT", f"{amount:.2f}", f"{self.equity:.2f}", reason
+            ])
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        self.seen_event_ids.add(e_id)
+        logger.info("Auditable deposit recorded: +$%.2f (%s) [ID: %s]. New equity: $%.2f", amount, reason, e_id, self.equity)
         return self.equity
+
+    def record_withdrawal(self, amount: float, reason: str = "Withdrawal", event_id: str | None = None) -> float:
+        """
+        Explicitly records an auditable capital withdrawal and persists to disk.
+        Rejects overdrafts.
+        """
+        if amount <= 0:
+            raise ValueError(f"Withdrawal amount must be positive, got {amount}")
+        if amount > self.equity:
+            raise ValueError(f"Withdrawal amount (${amount:.2f}) exceeds current equity (${self.equity:.2f})")
+
+        e_id = event_id or f"wth_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+        if e_id in self.seen_event_ids:
+            logger.info("Withdrawal event %s already processed. Skipping duplicate.", e_id)
+            return self.equity
+
+        self.equity = round(self.equity - amount, 2)
+        now_str = datetime.now(timezone.utc).isoformat()
+        with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now_str, e_id, "WITHDRAWAL", f"-{amount:.2f}", f"{self.equity:.2f}", reason
+            ])
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        self.seen_event_ids.add(e_id)
+        logger.info("Auditable withdrawal recorded: -$%.2f (%s) [ID: %s]. New equity: $%.2f", amount, reason, e_id, self.equity)
+        return self.equity
+
+    def reconcile_ledger(self) -> tuple[bool, float, str]:
+        """
+        Reconstructs balance from scratch by replaying all valid events in the durable ledger CSV.
+        Verifies reconciliation against in-memory self.equity.
+        """
+        if not self.ledger_file.exists():
+            return False, 0.0, "Ledger file does not exist"
+
+        computed_balance = 0.0
+        seen_ids = set()
+        first_row = True
+        try:
+            with open(self.ledger_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    e_id = row.get("event_id")
+                    if not e_id or e_id in seen_ids:
+                        continue
+                    try:
+                        amt = float(row["amount_usd"])
+                        if first_row:
+                            computed_balance = amt
+                            first_row = False
+                        else:
+                            computed_balance = round(computed_balance + amt, 2)
+                        seen_ids.add(e_id)
+                    except (ValueError, KeyError):
+                        continue
+            discrepancy = round(abs(self.equity - computed_balance), 2)
+            if discrepancy < 0.01:
+                return True, self.equity, "RECONCILED_OK"
+            else:
+                return False, computed_balance, f"Discrepancy: in-memory ${self.equity:.2f} != ledger ${computed_balance:.2f}"
+        except Exception as e:
+            return False, self.equity, f"Reconciliation exception: {e}"
+
+    def get_ledger_history(self) -> list[dict]:
+        """Returns all recorded transactions from the durable ledger."""
+        if not self.ledger_file.exists():
+            return []
+        records = []
+        try:
+            with open(self.ledger_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    records.append(dict(row))
+        except Exception as e:
+            logger.warning("Error reading ledger history: %s", e)
+        return records
 
     def _check_mt5_connection(self):
         # Default safely to Octa High-Fidelity Shadow Demo to guarantee non-blocking, reliable execution
@@ -247,6 +410,7 @@ class OctaBrokerAdapter:
         ticket = f"OCTA_{int(time.time())}_{uuid.uuid4().hex[:5]}"
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+        execution_type = "BROKER_DEMO_MT5" if self.is_mt5_live else "PAPER_SIMULATION"
         pos = BrokerPosition(
             ticket=ticket,
             symbol=self.symbol,
@@ -258,10 +422,14 @@ class OctaBrokerAdapter:
             tp1=tp1,
             tp2=tp2,
             be_active=False,
-            status="OPEN"
+            status="OPEN",
+            execution_type=execution_type,
         )
         self.open_positions[ticket] = pos
-        logger.info("OCTA DEMO FILL: %s %s %.2f lots @ %.2f (SL: %.2f, TP1: %.2f)", ticket, side, pos.lots, fill_price, sl, tp1)
+        if self.is_mt5_live:
+            logger.info("[BROKER_DEMO_MT5] GENUINE MT5 DEMO FILL: %s %s %.2f lots @ %.2f (SL: %.2f, TP1: %.2f)", ticket, side, pos.lots, fill_price, sl, tp1)
+        else:
+            logger.info("[PAPER_SIMULATION] SHADOW PAPER FILL: %s %s %.2f lots @ %.2f (SL: %.2f, TP1: %.2f)", ticket, side, pos.lots, fill_price, sl, tp1)
         return pos
 
     def on_tick(self, high: float, low: float, close: float) -> list[str]:
@@ -354,13 +522,28 @@ class OctaBrokerAdapter:
                     writer.writerow([
                         pos.ticket, pos.open_time, pos.close_time, pos.symbol, pos.side,
                         pos.lots, pos.open_price, pos.close_price, pos.sl, pos.tp1, pos.tp2,
-                        pos.pnl_usd, pos.pnl_pips, pos.pnl_R, pos.close_reason, self.equity
+                        pos.pnl_usd, pos.pnl_pips, pos.pnl_R, pos.close_reason, self.equity, pos.execution_type
                     ])
+
+                # Persist transaction to durable ledger
+                pnl_event_id = f"pnl_{ticket}"
+                if pnl_event_id not in self.seen_event_ids:
+                    with open(self.ledger_file, "a", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            pos.close_time, pnl_event_id, "TRADE_CLOSED_PNL", f"{pnl_usd:.2f}", f"{self.equity:.2f}", f"{pos.execution_type} {pos.side} {pos.lots}L {ticket} ({reason})"
+                        ])
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except Exception:
+                            pass
+                    self.seen_event_ids.add(pnl_event_id)
 
                 del self.open_positions[ticket]
                 self.closed_positions.append(pos)
                 events.append(
-                    f"🏁 {pos.ticket} CLOSED: {pos.side} @ {close_price:.2f} | Reason: {reason} | PnL: ${pnl_usd:+.2f} ({pnl_pips:+.1f} pips, {pnl_R:+.2f}R) | Equity: ${self.equity:.2f}"
+                    f"🏁 [{pos.execution_type}] {pos.ticket} CLOSED: {pos.side} @ {close_price:.2f} | Reason: {reason} | PnL: ${pnl_usd:+.2f} ({pnl_pips:+.1f} pips, {pnl_R:+.2f}R) | Equity: ${self.equity:.2f}"
                 )
 
         return events

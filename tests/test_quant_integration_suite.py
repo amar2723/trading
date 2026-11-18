@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import joblib
@@ -17,6 +18,7 @@ from src.broker_adapter import OctaBrokerAdapter, SpreadQuote
 from src.risk_governor import RiskGovernor
 from src.live_data import validate_candle_dataframe
 from scripts.autonomous_live_trader import ProductionRuntimeManager, analyze_with_6_master_upgrades
+from scripts.mt5_broker_diagnostic import run_broker_diagnostic
 
 ROOT = Path(__file__).resolve().parents[1]
 ENSEMBLE_PATH = ROOT / "models/xauusd_master_ensemble.pkl"
@@ -229,28 +231,46 @@ def test_stale_candle_rejection():
 # 9. Test Futures-to-Spot Mismatch Failsafe & Strict Provenance Gating
 def test_futures_to_spot_mismatch_failsafe():
     mgr = ProductionRuntimeManager()
-    dates = pd.date_range("2026-11-18 10:00", periods=50, freq="5min")
-    close_vals = np.linspace(2600.0, 2620.0, 50)
+    n_bars = 50
+    dates = pd.date_range("2026-11-18 10:00", periods=n_bars, freq="5min")
+
+    # Build market data that unconditionally produces a DONCHIAN_BREAKOUT BUY candidate:
+    # First 49 bars oscillate between 2600.0 and 2601.0 (keeping RSI healthy ~55 and donch_high = 2601.5)
+    # Bar 50 breaks out to 2603.0 (> donch_high 2601.5)
+    closes = [2600.0 if i % 2 == 0 else 2601.0 for i in range(n_bars - 1)] + [2603.0]
+    highs = [c + 0.5 for c in closes]
+    lows = [c - 0.5 for c in closes]
+    opens = [c - 0.1 for c in closes]
+
     df_futures = pd.DataFrame({
         "timestamp": dates,
-        "open": close_vals - 0.5,
-        "high": close_vals + 1.0,
-        "low": close_vals - 1.0,
-        "close": close_vals,
-        "tick_volume": [200.0] * 50,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "tick_volume": [200.0] * n_bars,
         "data_source": "YAHOO_GC_F_FUTURES_PROXY",
         "is_futures_proxy": True,
         "is_broker_spot": False,
+        "h1_trend_bias": [1] * n_bars,
+        "h1_dist_ema50": [0.5] * n_bars,
     })
 
-    # Even if ALLOW_PROXY_EXECUTION is set, strict safety veto prohibits execution
+    # Even if an environment variable attempts to allow proxy execution, strict safety veto prohibits it
     os.environ["ALLOW_PROXY_EXECUTION"] = "1"
-    analysis = analyze_with_6_master_upgrades(df_futures, mgr)
+    analysis_futures = analyze_with_6_master_upgrades(df_futures, mgr)
 
-    # If setup fired, it must be strictly blocked to HOLD with clear provenance reason
-    if "BLOCKED_NON_BROKER_DATA" in analysis["strategy"]:
-        assert analysis["action"] == "HOLD"
-        assert "execution strictly prohibited on non-broker data source" in analysis["why"].lower()
+    # UNCONDITIONAL ASSERTIONS: Must veto to HOLD with BLOCKED_NON_BROKER_DATA
+    assert analysis_futures["action"] == "HOLD"
+    assert analysis_futures["strategy"] == "DONCHIAN_BREAKOUT (BLOCKED_NON_BROKER_DATA)"
+    assert "execution strictly prohibited on non-broker data source 'yahoo_gc_f_futures_proxy'" in analysis_futures["why"].lower()
+
+    # Case B: Untagged data source (missing is_broker_spot and data_source)
+    df_untagged = df_futures.drop(columns=["data_source", "is_futures_proxy", "is_broker_spot"])
+    analysis_untagged = analyze_with_6_master_upgrades(df_untagged, mgr)
+    assert analysis_untagged["action"] == "HOLD"
+    assert analysis_untagged["strategy"] == "DONCHIAN_BREAKOUT (BLOCKED_NON_BROKER_DATA)"
+    assert "execution strictly prohibited on non-broker data source 'unknown'" in analysis_untagged["why"].lower()
 
 
 # 10. Test Full Autonomous Scanner Initialization
@@ -388,3 +408,200 @@ def test_ml_meta_filter_none_defaults_and_failsafe():
     )
     assert decision_stripped.decision == "ABSTAIN"
     assert "Missing required H1 higher-timeframe features" in decision_stripped.filter_reason
+
+
+# 15. Test Durable Ledger Persistence Across Process Restarts, Duplicates & Corruption
+def test_durable_ledger_persistence_and_reconciliation(tmp_path):
+    trades_file = tmp_path / "octa_test_trades.csv"
+    ledger_file = tmp_path / "octa_test_ledger.csv"
+
+    # Step 1: Initialize adapter with $40.68 demo capital
+    adapter = OctaBrokerAdapter(
+        initial_demo_equity=40.68,
+        csv_file=trades_file,
+        ledger_file=ledger_file,
+    )
+    assert adapter.get_account_equity() == 40.68
+
+    # Step 2: Record deposit of $100.00
+    adapter.record_deposit(100.00, "Verified Test Deposit", event_id="dep_001")
+    assert adapter.get_account_equity() == 140.68
+
+    # Step 3: Duplicate event ID must be idempotent (skipped without double-counting)
+    adapter.record_deposit(100.00, "Duplicate Test Deposit", event_id="dep_001")
+    assert adapter.get_account_equity() == 140.68
+
+    # Step 4: Invalid amounts must be rejected with ValueError
+    with pytest.raises(ValueError):
+        adapter.record_deposit(-50.0, "Invalid Negative Deposit")
+
+    # Step 5: Record withdrawal of $20.00
+    adapter.record_withdrawal(20.00, "Verified Test Withdrawal", event_id="wth_001")
+    assert adapter.get_account_equity() == 120.68
+
+    # Overdraft withdrawal must be rejected
+    with pytest.raises(ValueError):
+        adapter.record_withdrawal(500.00, "Overdraft Withdrawal")
+
+    # Step 6: Verify ledger reconciliation
+    reconciled, bal, msg = adapter.reconcile_ledger()
+    assert reconciled is True
+    assert bal == 120.68
+    assert msg == "RECONCILED_OK"
+
+    # Step 7: Simulate process restart — load a brand new adapter pointing to same files
+    adapter_restarted = OctaBrokerAdapter(
+        initial_demo_equity=40.68,
+        csv_file=trades_file,
+        ledger_file=ledger_file,
+    )
+    # Balance must be perfectly reconstructed from the append-only ledger
+    assert adapter_restarted.get_account_equity() == 120.68
+
+    # Step 8: Handle corrupted ledger row safely without crashing
+    with open(ledger_file, "a", encoding="utf-8") as f:
+        f.write("corrupted_timestamp,corrupt_id,UNKNOWN,not_a_number,also_corrupt,corrupted_desc\n")
+
+    adapter_resilient = OctaBrokerAdapter(
+        initial_demo_equity=40.68,
+        csv_file=trades_file,
+        ledger_file=ledger_file,
+    )
+    assert adapter_resilient.get_account_equity() == 120.68
+
+
+# 16. Test Mocked MT5 Connected Diagnostic Paths
+def test_mt5_diagnostic_mocked_scenarios():
+    class MockMT5:
+        def __init__(
+            self,
+            trade_mode=0,  # 0=DEMO, 2=REAL
+            connected=True,
+            quote_age_sec=5.0,
+            missing_account=False,
+            invalid_specs=False,
+        ):
+            self.trade_mode = trade_mode
+            self.connected = connected
+            self.quote_age_sec = quote_age_sec
+            self.missing_account = missing_account
+            self.invalid_specs = invalid_specs
+
+        def initialize(self, *args, **kwargs):
+            return True
+
+        def shutdown(self):
+            pass
+
+        def last_error(self):
+            return (1, "OK")
+
+        def terminal_info(self):
+            return type("TerminalInfo", (), {
+                "_asdict": lambda s: {
+                    "name": "MetaTrader 5",
+                    "path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+                    "connected": self.connected,
+                    "trade_allowed": True,
+                    "ping_last": 15,
+                }
+            })()
+
+        def account_info(self):
+            if self.missing_account:
+                return None
+            return type("AccountInfo", (), {
+                "_asdict": lambda s: {
+                    "login": 8839201,
+                    "trade_mode": self.trade_mode,
+                    "server": "OctaFX-Demo",
+                    "currency": "USD",
+                    "balance": 1000.0,
+                    "equity": 1000.0,
+                    "margin_free": 1000.0,
+                    "leverage": 500,
+                    "name": "Quant Demo Account",
+                    "company": "Octa Markets Ltd",
+                }
+            })()
+
+        def symbol_info(self, symbol):
+            if self.invalid_specs:
+                return type("SymbolInfo", (), {"_asdict": lambda s: {"digits": 2, "point": 0.01, "trade_contract_size": 0.0, "volume_min": 0.01}})()
+            return type("SymbolInfo", (), {
+                "_asdict": lambda s: {
+                    "digits": 2,
+                    "point": 0.01,
+                    "trade_contract_size": 100.0,
+                    "volume_min": 0.01,
+                    "volume_step": 0.01,
+                    "volume_max": 100.0,
+                    "spread": 42,
+                    "trade_mode": 4,
+                    "currency_base": "XAU",
+                    "currency_profit": "USD",
+                    "currency_margin": "USD",
+                }
+            })()
+
+        def symbol_select(self, symbol, enable):
+            return True
+
+        def symbol_info_tick(self, symbol):
+            tick_time = time.time() - self.quote_age_sec
+            return type("Tick", (), {
+                "bid": 2600.00,
+                "ask": 2600.42,
+                "time": int(tick_time),
+            })()
+
+    # Scenario 1: Fully verified DEMO connection with fresh quotes
+    mock_demo = MockMT5(trade_mode=0, connected=True, quote_age_sec=5.0)
+    res_demo = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_demo)
+    assert res_demo["status"] == "CONNECTED_DEMO_VERIFIED"
+    assert res_demo["account_info"]["trade_mode"] == "DEMO"
+    assert res_demo["live_quote"]["is_fresh"] is True
+    assert res_demo["live_quote"]["spread_usd"] == 0.42
+    assert res_demo["live_quote"]["spread_pips"] == 4.2
+
+    # Scenario 2: REAL money account must be BLOCKED
+    mock_real = MockMT5(trade_mode=2, connected=True)
+    res_real = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_real)
+    assert res_real["status"] == "BLOCKED_REAL_ACCOUNT"
+    assert "safety veto: real-money" in res_real["notes"][-1].lower()
+
+    # Scenario 3: Stale broker quote (> 30 seconds old)
+    mock_stale = MockMT5(trade_mode=0, connected=True, quote_age_sec=45.0)
+    res_stale = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_stale)
+    assert res_stale["status"] == "STALE_BROKER_QUOTE"
+    assert res_stale["live_quote"]["is_fresh"] is False
+
+    # Scenario 4: Missing / not logged in account
+    mock_no_acc = MockMT5(missing_account=True)
+    res_no_acc = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_no_acc)
+    assert res_no_acc["status"] == "NO_ACCOUNT_LOGGED_IN"
+
+    # Scenario 5: Invalid symbol specs
+    mock_bad_specs = MockMT5(invalid_specs=True)
+    res_bad_specs = run_broker_diagnostic(symbol="XAUUSD", mt5_lib=mock_bad_specs)
+    assert res_bad_specs["status"] == "INVALID_SYMBOL_SPECS"
+
+
+# 17. Test SpreadQuote Property Aliases
+def test_spread_quote_property_aliases():
+    q = SpreadQuote.from_bid_ask(
+        bid=2600.00,
+        ask=2600.42,
+        time_str="2026-11-18T12:00:00Z",
+        is_broker_confirmed=True,
+        quote_source="BROKER_MT5_SPOT",
+    )
+    # Authoritative properties
+    assert q.spread_price_usd == 0.42
+    assert q.time == "2026-11-18T12:00:00Z"
+    # Backwards-compatible aliases
+    assert q.spread_usd == 0.42
+    assert q.quote_time == "2026-11-18T12:00:00Z"
+    assert q["spread_price_usd"] == 0.42
+    assert q["spread_pips"] == 4.2
+    assert q["spread_points"] == 42.0

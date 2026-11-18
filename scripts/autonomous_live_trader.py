@@ -337,6 +337,7 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         equity=broker.equity,
         risk_pips=risk_dist * 10.0,
         stop_dist_usd=risk_dist,
+        spread_price_usd=quote.spread_price_usd,
         current_spread_pips=quote.spread_pips,
         open_positions_count=len(broker.open_positions),
         session_hour=curr_hour,

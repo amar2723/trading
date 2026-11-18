@@ -57,15 +57,16 @@ def find_terminal_executable() -> str | None:
     return None
 
 
-def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) -> dict:
+def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0, mt5_lib=None) -> dict:
+    _mt5 = mt5_lib if mt5_lib is not None else mt5
     timestamp_utc = datetime.now(timezone.utc).isoformat()
     term_path = find_terminal_executable()
-    process_active = is_terminal_process_active()
+    process_active = is_terminal_process_active() if mt5_lib is None else True
 
     result = {
         "diagnostic_time_utc": timestamp_utc,
         "symbol_requested": symbol,
-        "mt5_package_installed": mt5 is not None,
+        "mt5_package_installed": _mt5 is not None,
         "terminal_executable_path": term_path,
         "terminal_process_active": process_active,
         "terminal_connected": False,
@@ -77,7 +78,7 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
         "notes": [],
     }
 
-    if mt5 is None:
+    if _mt5 is None:
         result["status"] = "MT5_PACKAGE_NOT_INSTALLED"
         result["notes"].append("MetaTrader5 python package is not installed in the active environment.")
         return result
@@ -90,32 +91,36 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
             "The desktop terminal process ('terminal64.exe') is currently NOT running in your Windows session."
         )
         result["notes"].append(
-            "To connect: Open MetaTrader 5 on your desktop, log into your Octa Demo/Live account, and ensure Algo Trading is enabled."
+            "To connect: Open MetaTrader 5 on your desktop, log into your Octa Demo account, and ensure Algo Trading is enabled."
         )
         return result
 
-    # When process is active, attempt safe initialization with timeout
+    # When process is active, attempt safe initialization with non-blocking timeout
     def _do_init():
-        if term_path:
-            return mt5.initialize(path=term_path, timeout=int(timeout_seconds * 1000))
-        return mt5.initialize(timeout=int(timeout_seconds * 1000))
+        if term_path and mt5_lib is None:
+            return _mt5.initialize(path=term_path, timeout=int(timeout_seconds * 1000))
+        return _mt5.initialize(timeout=int(timeout_seconds * 1000))
 
     init_ok = False
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_do_init)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do_init)
-            init_ok = future.result(timeout=timeout_seconds)
+        init_ok = future.result(timeout=timeout_seconds)
     except concurrent.futures.TimeoutError:
+        executor.shutdown(wait=False, cancel_futures=True)
         result["status"] = "INITIALIZE_TIMEOUT"
         result["notes"].append(f"mt5.initialize() timed out after {timeout_seconds} seconds.")
         return result
     except Exception as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
         result["status"] = "INITIALIZE_EXCEPTION"
         result["notes"].append(f"mt5.initialize() raised exception: {exc}")
         return result
+    finally:
+        executor.shutdown(wait=False)
 
     if not init_ok:
-        err = mt5.last_error()
+        err = _mt5.last_error()
         result["status"] = "TERMINAL_CONNECT_FAILED"
         result["notes"].append(f"Failed to connect to active MT5 terminal. Last MT5 error: {err}")
         return result
@@ -123,22 +128,23 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
     result["terminal_connected"] = True
 
     # Terminal info
-    t_info = mt5.terminal_info()
+    t_info = _mt5.terminal_info()
     if t_info is not None:
         t_dict = t_info._asdict() if hasattr(t_info, "_asdict") else dict(t_info)
         result["terminal_info"] = {
             "name": t_dict.get("name"),
             "path": t_dict.get("path"),
-            "connected": t_dict.get("connected"),
-            "trade_allowed": t_dict.get("trade_allowed"),
+            "connected": bool(t_dict.get("connected", False)),
+            "trade_allowed": bool(t_dict.get("trade_allowed", False)),
             "ping_last": t_dict.get("ping_last"),
         }
 
     # Account info
-    acc_info = mt5.account_info()
+    acc_info = _mt5.account_info()
     if acc_info is not None:
         acc_dict = acc_info._asdict() if hasattr(acc_info, "_asdict") else dict(acc_info)
         trade_mode_val = acc_dict.get("trade_mode")
+        # MT5 trade modes: 0 = DEMO, 1 = CONTEST, 2 = REAL
         trade_mode_str = "DEMO" if trade_mode_val == 0 else ("CONTEST" if trade_mode_val == 1 else "REAL")
         result["account_info"] = {
             "login": acc_dict.get("login"),
@@ -160,7 +166,7 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
     symbols_to_try = [symbol, "GOLD", "XAUUSDm", "XAUUSD.a", "XAUUSD_i"]
     selected_symbol = None
     for sym in symbols_to_try:
-        s_info = mt5.symbol_info(sym)
+        s_info = _mt5.symbol_info(sym)
         if s_info is not None:
             selected_symbol = sym
             break
@@ -168,11 +174,11 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
     if selected_symbol is None:
         result["status"] = "SYMBOL_NOT_FOUND"
         result["notes"].append(f"Could not find {symbol} or common aliases among broker symbols.")
-        mt5.shutdown()
+        _mt5.shutdown()
         return result
 
-    mt5.symbol_select(selected_symbol, True)
-    sym_info = mt5.symbol_info(selected_symbol)
+    _mt5.symbol_select(selected_symbol, True)
+    sym_info = _mt5.symbol_info(selected_symbol)
     if sym_info is not None:
         sd = sym_info._asdict() if hasattr(sym_info, "_asdict") else dict(sym_info)
         result["symbol_specs"] = {
@@ -191,8 +197,8 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
         }
 
     # Live Quote & Freshness
-    tick = mt5.symbol_info_tick(selected_symbol)
-    if tick is not None and tick.ask > tick.bid > 0:
+    tick = _mt5.symbol_info_tick(selected_symbol)
+    if tick is not None and getattr(tick, "ask", 0) > getattr(tick, "bid", 0) > 0:
         quote = SpreadQuote.from_bid_ask(
             bid=tick.bid,
             ask=tick.ask,
@@ -207,19 +213,42 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0) 
         result["live_quote"] = {
             "bid": quote.bid,
             "ask": quote.ask,
-            "spread_usd": quote.spread_usd,
+            "spread_price_usd": quote.spread_price_usd,
+            "spread_usd": quote.spread_price_usd,
             "spread_points": quote.spread_points,
             "spread_pips": quote.spread_pips,
-            "tick_time_utc": quote.quote_time,
+            "tick_time_utc": quote.time,
+            "quote_time": quote.time,
             "latency_seconds": latency_sec,
-            "is_fresh": (latency_sec <= 30.0),
+            "is_fresh": (0.0 <= latency_sec <= 30.0),
         }
-        result["status"] = "CONNECTED_VERIFIED"
     else:
         result["notes"].append("symbol_info_tick returned invalid or zero tick data.")
-        result["status"] = "NO_LIVE_TICK"
 
-    mt5.shutdown()
+    # Strict Validation Gate for CONNECTED_DEMO_VERIFIED
+    if not result["account_info"]:
+        result["status"] = "NO_ACCOUNT_LOGGED_IN"
+        result["notes"].append("No trading account is logged in on the MT5 terminal.")
+    elif result["account_info"].get("trade_mode") == "REAL":
+        result["status"] = "BLOCKED_REAL_ACCOUNT"
+        result["notes"].append("SAFETY VETO: Real-money live trading account detected. Automated execution is strictly prohibited on real accounts.")
+    elif not result["terminal_info"].get("connected"):
+        result["status"] = "TERMINAL_NOT_CONNECTED_TO_SERVER"
+        result["notes"].append("MT5 terminal reports no active connection to broker trade server.")
+    elif not result["symbol_specs"] or (result["symbol_specs"].get("contract_size") or 0) <= 0:
+        result["status"] = "INVALID_SYMBOL_SPECS"
+        result["notes"].append(f"Symbol specifications for {selected_symbol} are missing or invalid.")
+    elif not result["live_quote"]:
+        result["status"] = "NO_LIVE_TICK"
+        result["notes"].append(f"No valid tick quote received for {selected_symbol}.")
+    elif not result["live_quote"].get("is_fresh"):
+        result["status"] = "STALE_BROKER_QUOTE"
+        result["notes"].append(f"Broker quote latency ({result['live_quote']['latency_seconds']:.1f}s) exceeds 30.0s freshness limit.")
+    else:
+        result["status"] = "CONNECTED_DEMO_VERIFIED"
+        result["notes"].append(f"All pre-flight checks verified: Connected to DEMO account {result['account_info']['login']} with fresh quotes.")
+
+    _mt5.shutdown()
     return result
 
 
