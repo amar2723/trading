@@ -60,7 +60,8 @@ class OctaBrokerAdapter:
         contract_size: float = 100.0,
         lot_step: float = 0.01,
         min_lot: float = 0.01,
-        mode: Literal["AUTO", "MT5", "SHADOW_DEMO"] = "AUTO"
+        mode: Literal["AUTO", "MT5", "SHADOW_DEMO"] = "AUTO",
+        csv_file: Path | str | None = None,
     ):
         self.symbol = symbol
         self.equity = initial_demo_equity
@@ -71,7 +72,7 @@ class OctaBrokerAdapter:
         self.is_mt5_live = False
         self.open_positions: dict[str, BrokerPosition] = {}
         self.closed_positions: list[BrokerPosition] = []
-        self.csv_file = DEMO_TRADES_CSV
+        self.csv_file = Path(csv_file) if csv_file is not None else DEMO_TRADES_CSV
         self._init_csv()
         self._check_mt5_connection()
 
@@ -211,53 +212,59 @@ class OctaBrokerAdapter:
             closed = False
             close_price = close
             reason = ""
+            pnl_usd = 0.0
+            pnl_pips = 0.0
+            pnl_R = 0.0
+
+            was_be_active = pos.be_active
+            eval_sl = pos.sl
 
             if side == "BUY":
-                # Dynamic Break-Even trigger (at +0.75 ATR)
-                if not pos.be_active and high >= entry + be_dist:
-                    pos.be_active = True
-                    pos.sl = entry
-                    events.append(f"🔒 {pos.ticket} (BUY) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
-
-                # Target & Stop Check (Conservative: if same bar hits both, SL hit first)
-                if low <= pos.sl and high >= tp1:
+                # Check stop loss against active stop at start of candle (conservative: if both SL and TP hit, SL assumed first)
+                if low <= eval_sl and high >= tp1:
                     closed = True
-                    close_price = pos.sl - 0.05 # exit slip
-                    reason = "STOP_LOSS (Same-Bar Conservative)"
-                elif low <= pos.sl:
+                    close_price = eval_sl - 0.05  # exit slippage
+                    reason = "STOP_LOSS (Conservative)"
+                elif low <= eval_sl:
                     closed = True
-                    close_price = pos.sl - 0.05
-                    reason = "BREAK_EVEN" if pos.be_active else "STOP_LOSS"
+                    close_price = eval_sl - 0.05
+                    reason = "BREAK_EVEN" if was_be_active else "STOP_LOSS"
                 elif high >= tp1:
                     closed = True
                     close_price = tp1 - 0.05
                     reason = "TAKE_PROFIT_1"
+                elif not pos.be_active and high >= entry + be_dist:
+                    # Break-Even activated for SUBSEQUENT candles/ticks; cannot trigger exit on this same candle
+                    pos.be_active = True
+                    pos.sl = entry
+                    events.append(f"🔒 {pos.ticket} (BUY) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
 
                 if closed:
                     pnl_usd = round((close_price - entry) * lots * self.contract_size, 2)
+                    pnl_pips = round((close_price - entry) * 10.0, 1)
                     pnl_R = round(pnl_usd / max(0.01, one_R), 3)
 
             else:  # SELL
-                if not pos.be_active and low <= entry - be_dist:
-                    pos.be_active = True
-                    pos.sl = entry
-                    events.append(f"🔒 {pos.ticket} (SELL) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
-
-                if high >= pos.sl and low <= tp1:
+                if high >= eval_sl and low <= tp1:
                     closed = True
-                    close_price = pos.sl + 0.05
-                    reason = "STOP_LOSS (Same-Bar Conservative)"
-                elif high >= pos.sl:
+                    close_price = eval_sl + 0.05
+                    reason = "STOP_LOSS (Conservative)"
+                elif high >= eval_sl:
                     closed = True
-                    close_price = pos.sl + 0.05
-                    reason = "BREAK_EVEN" if pos.be_active else "STOP_LOSS"
+                    close_price = eval_sl + 0.05
+                    reason = "BREAK_EVEN" if was_be_active else "STOP_LOSS"
                 elif low <= tp1:
                     closed = True
                     close_price = tp1 + 0.05
                     reason = "TAKE_PROFIT_1"
+                elif not pos.be_active and low <= entry - be_dist:
+                    pos.be_active = True
+                    pos.sl = entry
+                    events.append(f"🔒 {pos.ticket} (SELL) SL moved to Break-Even at {entry:.2f} (+${be_dist:.2f} gained)")
 
                 if closed:
                     pnl_usd = round((entry - close_price) * lots * self.contract_size, 2)
+                    pnl_pips = round((entry - close_price) * 10.0, 1)
                     pnl_R = round(pnl_usd / max(0.01, one_R), 3)
 
             if closed:
