@@ -55,21 +55,9 @@ def test_calibrator_integration_consistency():
     xgb_m = model_dict["xgb_model"]
     lgb_m = model_dict["lgb_model"]
 
-    # Generate dummy input row
-    dummy_dict = {col: 0.5 for col in FEATURE_COLUMNS}
-    dummy_dict["side_code"] = 1.0
-    dummy_dict["is_pullback"] = 1.0
-    feat_row = pd.DataFrame([dummy_dict], columns=FEATURE_COLUMNS)
+    # Filter object under test
+    filter_obj = MLMetaFilter(model_path=ENSEMBLE_PATH, require_calibration=True)
 
-    X_scaled = scaler.transform(feat_row)
-    p_xgb = float(xgb_m.predict_proba(X_scaled)[0][1])
-    p_lgb = float(lgb_m.predict_proba(X_scaled)[0][1])
-    p_raw = (p_xgb * 0.55) + (p_lgb * 0.45)
-    p_cal_expected = round(float(np.clip(calibrator.predict(np.array([p_raw]))[0], 0.0, 1.0)), 4)
-
-    # Now evaluate through MLMetaFilter
-    filter_obj = MLMetaFilter(model_path=ENSEMBLE_PATH)
-    
     # Create test M5 candles
     dates = pd.date_range("2026-11-18 09:00", periods=50, freq="5min")
     df_test = pd.DataFrame({
@@ -82,6 +70,7 @@ def test_calibrator_integration_consistency():
     })
     df_test = compute_indicator_dataframe(df_test)
 
+    # 1. Evaluate candidate through MLMetaFilter
     decision = filter_obj.evaluate_candidate(
         candidate_action="BUY",
         strategy_name="H1_PULLBACK",
@@ -91,7 +80,64 @@ def test_calibrator_integration_consistency():
         risk_usd=4.50,
     )
 
-    assert isinstance(decision, FilterDecision)
-    assert 0.0 <= decision.predicted_win_prob <= 1.0
-    # Probability must reflect calibrator transformation, not uncalibrated raw score
-    assert decision.confidence_pct == round(decision.predicted_win_prob * 100, 1)
+    # 2. Independently compute expected raw and calibrated probability on the EXACT same feature row
+    last_row = df_test.iloc[-1].to_dict()
+    last_row["h1_trend_bias"] = 1
+    last_row["h1_dist_ema50"] = 0.0
+    feat_row = extract_features_from_row(last_row, "BUY", "H1_PULLBACK")
+    X_scaled = scaler.transform(feat_row[FEATURE_COLUMNS])
+
+    p_xgb = float(xgb_m.predict_proba(X_scaled)[0][1])
+    p_lgb = float(lgb_m.predict_proba(X_scaled)[0][1])
+    p_raw = (p_xgb * 0.55) + (p_lgb * 0.45)
+    p_cal_expected = round(float(np.clip(calibrator.predict(np.array([p_raw]))[0], 0.0, 1.0)), 4)
+
+    # 3. Assert predicted_win_prob matches calibrated probability within strict tolerance
+    assert abs(decision.predicted_win_prob - p_cal_expected) < 1e-4, (
+        f"Predicted win prob ({decision.predicted_win_prob}) must equal calibrated probability ({p_cal_expected})"
+    )
+
+    # 4. Assert calibrated probability is genuinely transformed and not identical to raw uncalibrated score
+    assert decision.predicted_win_prob != round(p_raw, 4), (
+        f"Calibrated probability ({decision.predicted_win_prob}) must differ from raw ensemble probability ({p_raw:.4f})"
+    )
+
+
+def test_missing_or_failing_calibrator_returns_abstain():
+    model_dict = joblib.load(ENSEMBLE_PATH)
+    filter_obj = MLMetaFilter(model_path=ENSEMBLE_PATH, require_calibration=True)
+
+    dates = pd.date_range("2026-11-18 09:00", periods=50, freq="5min")
+    df_test = pd.DataFrame({
+        "timestamp": dates,
+        "open": [2600.0] * 50,
+        "high": [2602.0] * 50,
+        "low": [2598.0] * 50,
+        "close": [2600.0] * 50,
+        "tick_volume": [200.0] * 50,
+    })
+
+    # Case A: Missing calibrator when require_calibration=True
+    filter_obj.ensemble = dict(model_dict)
+    filter_obj.ensemble["calibrator"] = None
+    decision_missing = filter_obj.evaluate_candidate(
+        candidate_action="BUY",
+        strategy_name="H1_PULLBACK",
+        df_m5=df_test,
+    )
+    assert decision_missing.decision == "ABSTAIN"
+    assert "missing required calibrator" in decision_missing.filter_reason.lower()
+
+    # Case B: Failing / Corrupted Calibrator
+    class FailingCalibrator:
+        def predict(self, x):
+            raise RuntimeError("Corrupted calibrator state")
+
+    filter_obj.ensemble["calibrator"] = FailingCalibrator()
+    decision_failing = filter_obj.evaluate_candidate(
+        candidate_action="BUY",
+        strategy_name="H1_PULLBACK",
+        df_m5=df_test,
+    )
+    assert decision_failing.decision == "ABSTAIN"
+    assert "calibrator error" in decision_failing.filter_reason.lower()

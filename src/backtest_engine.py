@@ -119,7 +119,7 @@ class EventDrivenBacktestEngine:
         self.strat_donchian = DonchianBreakoutStrategy()
         self.strat_squeeze = VolatilitySqueezeStrategy()
 
-    def run(self, df_m5: pd.DataFrame) -> BacktestResults:
+    def run(self, df_m5: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> BacktestResults:
         df = df_m5.copy()
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -129,8 +129,8 @@ class EventDrivenBacktestEngine:
         if n_bars < 60:
             raise ValueError(f"Insufficient bars for backtesting ({n_bars} < 60).")
 
-        # Ensure precomputed indicators via shared feature pipeline
-        df = compute_indicator_dataframe(df)
+        # Ensure precomputed indicators via shared feature pipeline (preserves pre-merged H1 or merges df_h1)
+        df = compute_indicator_dataframe(df, df_h1=df_h1)
 
         # Tracking state
         self.equity = self.initial_equity

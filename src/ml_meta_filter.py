@@ -36,8 +36,9 @@ class FilterDecision:
 
 
 class MLMetaFilter:
-    def __init__(self, model_path: Path | str = ENSEMBLE_PATH):
+    def __init__(self, model_path: Path | str = ENSEMBLE_PATH, require_calibration: bool = True):
         self.model_path = Path(model_path) if model_path is not None else ENSEMBLE_PATH
+        self.require_calibration = require_calibration
         self.ensemble = self._load_model()
 
     def _load_model(self) -> dict | None:
@@ -110,16 +111,33 @@ class MLMetaFilter:
             p_lgb = float(self.ensemble["lgb_model"].predict_proba(X_in)[0][1])
             p_raw = (p_xgb * 0.55) + (p_lgb * 0.45)
 
-            # Apply saved calibrator if present
+            # Apply required probability calibrator
             calibrator = self.ensemble.get("calibrator")
             if calibrator is not None:
                 try:
                     p_cal = float(calibrator.predict(np.array([p_raw]))[0])
+                    if np.isnan(p_cal) or np.isinf(p_cal):
+                        raise ValueError(f"Calibrator produced non-finite output: {p_cal}")
                     win_prob = round(float(np.clip(p_cal, 0.0, 1.0)), 4)
                 except Exception as cal_err:
-                    logger.warning("Calibrator inference error (%s); falling back to raw ensemble probability.", cal_err)
-                    win_prob = round(float(p_raw), 4)
+                    logger.error("Calibrator inference error (%s). ABSTAIN triggered (uncalibrated score substitution prohibited).", cal_err)
+                    return FilterDecision(
+                        decision="ABSTAIN",
+                        predicted_win_prob=0.0,
+                        expected_R=-1.0,
+                        confidence_pct=0.0,
+                        filter_reason=f"ABSTAIN: Calibrator error ({cal_err}). Uncalibrated scores prohibited.",
+                    )
             else:
+                if self.require_calibration:
+                    logger.error("Ensemble missing required calibrator. ABSTAIN triggered (uncalibrated score substitution prohibited).")
+                    return FilterDecision(
+                        decision="ABSTAIN",
+                        predicted_win_prob=0.0,
+                        expected_R=-1.0,
+                        confidence_pct=0.0,
+                        filter_reason="ABSTAIN: Ensemble missing required calibrator. Uncalibrated scores prohibited.",
+                    )
                 win_prob = round(float(p_raw), 4)
         except Exception as e:
             logger.error("ML inference error: %s. Failsafe ABSTAIN triggered.", e)

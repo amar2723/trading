@@ -15,7 +15,7 @@ def test_exact_cent_buy_execution_and_sl_exit(tmp_path):
     )
 
     # Place BUY order when current price is 2600.00
-    # Half-spread = 0.12, slippage = 0.05 -> Ask fill = 2600.17
+    # Verified Octa spread: Half-spread = 0.21, slippage = 0.05 -> Ask fill = 2600.26
     pos = adapter.execute_order(
         side="BUY",
         lots=0.01,
@@ -25,7 +25,7 @@ def test_exact_cent_buy_execution_and_sl_exit(tmp_path):
         tp2=2615.00,
     )
     assert pos is not None
-    assert pos.open_price == 2600.17
+    assert pos.open_price == 2600.26
     assert pos.lots == 0.01
 
     # Stop Loss hit: candle low drops to 2594.00
@@ -36,11 +36,11 @@ def test_exact_cent_buy_execution_and_sl_exit(tmp_path):
 
     assert closed.close_price == 2594.95
     assert closed.close_reason == "STOP_LOSS"
-    # Gross PnL: (2594.95 - 2600.17) * 0.01 * 100 = -5.22 USD
-    assert closed.pnl_usd == -5.22
-    assert closed.pnl_pips == -52.2
+    # Gross PnL: (2594.95 - 2600.26) * 0.01 * 100 = -5.31 USD
+    assert closed.pnl_usd == -5.31
+    assert closed.pnl_pips == -53.1
     assert closed.pnl_R < 0.0
-    assert adapter.equity == round(1000.0 - 5.22, 2)
+    assert adapter.equity == round(1000.0 - 5.31, 2)
 
 
 def test_exact_cent_sell_execution_and_tp_exit(tmp_path):
@@ -51,7 +51,7 @@ def test_exact_cent_sell_execution_and_tp_exit(tmp_path):
     )
 
     # Place SELL order when current price is 2600.00
-    # Bid = 2599.88 - slippage 0.05 -> Bid fill = 2599.83
+    # Bid = 2599.79 - slippage 0.05 -> Bid fill = 2599.74
     pos = adapter.execute_order(
         side="SELL",
         lots=0.01,
@@ -61,7 +61,7 @@ def test_exact_cent_sell_execution_and_tp_exit(tmp_path):
         tp2=2585.00,
     )
     assert pos is not None
-    assert pos.open_price == 2599.83
+    assert pos.open_price == 2599.74
 
     # TP hit: low reaches 2589.00
     # Exit price = TP 2590.00 + exit slippage 0.05 = 2590.05
@@ -71,11 +71,11 @@ def test_exact_cent_sell_execution_and_tp_exit(tmp_path):
 
     assert closed.close_price == 2590.05
     assert closed.close_reason == "TAKE_PROFIT_1"
-    # Gross PnL: (2599.83 - 2590.05) * 0.01 * 100 = +9.78 USD
-    assert closed.pnl_usd == 9.78
-    assert closed.pnl_pips == 97.8
+    # Gross PnL: (2599.74 - 2590.05) * 0.01 * 100 = +9.69 USD
+    assert closed.pnl_usd == 9.69
+    assert closed.pnl_pips == 96.9
     assert closed.pnl_R > 0.0
-    assert adapter.equity == round(1000.0 + 9.78, 2)
+    assert adapter.equity == round(1000.0 + 9.69, 2)
 
 
 def test_zero_auto_bump_on_sub_minimum_or_gap_risk():

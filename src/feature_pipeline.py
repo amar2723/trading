@@ -102,7 +102,7 @@ def compute_indicator_dataframe(
         df["buyer_pct"] = 50.0
 
     # Multi-Timeframe H1 Macro Trend Alignment
-    if df_h1 is not None and len(df_h1) >= 20:
+    if df_h1 is not None and len(df_h1) >= 2:
         h1 = df_h1.copy()
         if "timestamp" in h1.columns:
             h1["timestamp"] = pd.to_datetime(h1["timestamp"])
@@ -126,7 +126,13 @@ def compute_indicator_dataframe(
         )
         df["h1_trend_bias"] = merged["h1_trend_bias"].fillna(1).astype(int)
         df["h1_dist_ema50"] = ((merged["close"] - merged["h1_ema50"]) / merged["h1_ema50"] * 100.0).fillna(0.0)
+        df["h1_close"] = merged["h1_close"]
+        df["h1_completed_at"] = merged["h1_completed_at"]
         df["h1_source"] = "BROKER_H1_MERGE_ASOF"
+    elif "h1_trend_bias" in df.columns and "h1_dist_ema50" in df.columns:
+        # Preserve previously merged / computed causal H1 features (do not overwrite with M5 proxy)
+        if "h1_source" not in df.columns:
+            df["h1_source"] = "PRESERVED_EXISTING_H1"
     else:
         # Documented M5 Proxy (240-period EMA = 20 hours)
         h1_trend = df["close"].ewm(span=240).mean()

@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
 load_dotenv(ROOT / ".env")
 
 from src.live_data import fetch_live_candles
+from src.feature_pipeline import compute_indicator_dataframe
 from src.strategies.benchmark_strategies import (
     H1TrendM5PullbackStrategy,
     DonchianBreakoutStrategy,
@@ -214,109 +215,43 @@ class ProductionRuntimeManager:
 
 
 def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManager) -> dict:
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-    vol = df["tick_volume"].values
     timestamps = pd.to_datetime(df["timestamp"])
     last_ts = timestamps.iloc[-1]
     curr_hour = last_ts.hour
 
-    current_price = float(close[-1])
-    recent_high_20 = float(np.max(high[-20:]))
-    recent_low_20 = float(np.min(low[-20:]))
-
     # Upgrade 1: True Causal Higher-Timeframe (H1) Trend from completed bars
-    h1_trend_bias = 1
-    h1_dist_ema50 = 0.0
+    df_h1 = None
     try:
         df_h1 = fetch_live_candles("XAUUSD", "H1", 50)
-        if df_h1 is not None and len(df_h1) >= 20:
-            h1_closed = df_h1.iloc[:-1].copy()
-            h1_close = h1_closed["close"].values
-            h1_e50 = float(pd.Series(h1_close).ewm(span=50).mean().iloc[-1])
-            h1_e200 = float(pd.Series(h1_close).ewm(span=200).mean().iloc[-1])
-            h1_trend_bias = 1 if h1_close[-1] > h1_e200 else -1
-            h1_dist_ema50 = ((h1_close[-1] - h1_e50) / h1_e50) * 100
     except Exception as e:
         logger.warning("H1 causal fetch note: %s", e)
 
-    # M5 Intermediate EMAs
-    ema_20 = float(pd.Series(close).ewm(span=20).mean().iloc[-1])
-    ema_50 = float(pd.Series(close).ewm(span=50).mean().iloc[-1])
+    # Compute all indicators causally via shared feature pipeline
+    df_proc = compute_indicator_dataframe(df, df_h1=df_h1)
+    last_row = df_proc.iloc[-1]
+
+    current_price = float(last_row["close"])
+    h1_trend_bias = int(last_row["h1_trend_bias"])
+    h1_dist_ema50 = float(last_row["h1_dist_ema50"])
+    ema_20 = float(last_row["ema_20"])
+    ema_50 = float(last_row["ema_50"])
+    atr_val = float(last_row["atr"])
+    rsi_val = float(last_row["rsi"])
+    buyer_pct = float(last_row["buyer_pct"])
+    seller_pct = round(100.0 - buyer_pct, 1)
+
     is_strong_bull = current_price > ema_20 > ema_50
     is_strong_bear = current_price < ema_20 < ema_50
     regime = "TRENDING_BULLISH" if is_strong_bull else ("TRENDING_BEARISH" if is_strong_bear else "CHOP_RANGE")
 
-    # Upgrade 1B: Real M5 14-period RSI (Exhaustion & Overbought Filter)
-    diffs = pd.Series(close).diff()
-    gain = diffs.clip(lower=0).rolling(14).mean()
-    loss = (-diffs.clip(upper=0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
-    rsi_val = float((100 - (100 / (1 + rs))).iloc[-1])
-
-    # Upgrade 2: Session Killzone Detection
     is_london = 7 <= curr_hour <= 10
     is_ny = 12 <= curr_hour <= 16
-    is_prime = is_london or is_ny
-    is_asian = 0 <= curr_hour <= 6
-    session_name = "LONDON KILLZONE" if is_london else ("NEW YORK KILLZONE" if is_ny else ("ASIAN CHOP (Cautious)" if is_asian else "INTER-SESSION"))
-
-    # Upgrade 3: Dynamic ATR Volatility Sizing
-    tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
-    atr_val = float(pd.Series(tr).rolling(14).mean().iloc[-1])
-    atr_sl_dist = round(max(atr_val * 1.5, 3.0), 2)  # Hardened 3.0+ pt buffer
-
-    # Upgrade 4: Liquidity Sweep Confirmation (Post-Judas Filter)
-    prev_h20 = float(pd.Series(high).rolling(20).max().shift(1).iloc[-1])
-    prev_l20 = float(pd.Series(low).rolling(20).min().shift(1).iloc[-1])
-    sweep_high_confirmed = high[-1] > prev_h20 and close[-1] < prev_h20
-    sweep_low_confirmed = low[-1] < prev_l20 and close[-1] > prev_l20
-
-    # Order Flow Volume Delta
-    price_deltas = np.diff(close[-15:])
-    volumes = vol[-14:]
-    b_vol = np.sum(volumes[price_deltas >= 0]) if np.any(price_deltas >= 0) else 1.0
-    s_vol = np.sum(volumes[price_deltas < 0]) if np.any(price_deltas < 0) else 1.0
-    tot_vol = b_vol + s_vol
-    buyer_pct = round((b_vol / tot_vol) * 100, 1)
-    seller_pct = round((s_vol / tot_vol) * 100, 1)
-
-    # Discount Depth
-    range_span = max(0.1, recent_high_20 - recent_low_20)
-    discount_depth = (current_price - recent_low_20) / range_span
-
-    # Master Ensemble Inference
-    ml_confidence = 80.0
-    if mgr.ensemble is not None and len(df) >= 30:
-        try:
-            feat_row = pd.DataFrame([{
-                "htf_trend_bias": h1_trend_bias,
-                "h1_dist_ema50": h1_dist_ema50,
-                "dist_ema_50": (current_price - ema_50) / ema_50 * 100,
-                "is_prime_session": 1 if is_prime else 0,
-                "is_asian_chop": 1 if is_asian else 0,
-                "atr_pct": (atr_val / current_price) * 100,
-                "volatility_expansion": 1.0,
-                "discount_depth": discount_depth,
-                "sweep_high_confirmed": 1 if sweep_high_confirmed else 0,
-                "sweep_low_confirmed": 1 if sweep_low_confirmed else 0,
-                "signed_tick_volume_proxy": float(price_deltas[-1] >= 0) * vol[-1] - float(price_deltas[-1] < 0) * vol[-1],
-                "cvd_slope": float(np.sum(np.where(price_deltas >= 0, volumes, -volumes))),
-                "signed_buyer_proxy_pct": buyer_pct,
-                "rsi": rsi_val,
-            }])
-            p_xgb = float(mgr.ensemble["xgb_model"].predict_proba(feat_row)[0][1])
-            p_lgb = float(mgr.ensemble["lgb_model"].predict_proba(feat_row)[0][1])
-            ml_confidence = round(((p_xgb * 0.55) + (p_lgb * 0.45)) * 100, 1)
-        except Exception as e:
-            logger.warning("Ensemble note: %s", e)
+    session_name = "LONDON KILLZONE" if is_london else ("NEW YORK KILLZONE" if is_ny else ("ASIAN CHOP (Cautious)" if (0 <= curr_hour <= 6) else "INTER-SESSION"))
 
     # Phase 2 Strategy Layer Evaluation (Deterministic Entry Engines)
-    df_h1_data = df_h1 if 'df_h1' in locals() and df_h1 is not None else None
-    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df, df_h1_data)
-    sig_donchian = DonchianBreakoutStrategy.evaluate(df, df_h1_data)
-    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df, df_h1_data)
+    sig_pullback = H1TrendM5PullbackStrategy.evaluate(df_proc, df_h1)
+    sig_donchian = DonchianBreakoutStrategy.evaluate(df_proc, df_h1)
+    sig_squeeze = VolatilitySqueezeStrategy.evaluate(df_proc, df_h1)
 
     # Strategy Priority: 1. Value Pullback (Highest Expectancy) -> 2. Breakout -> 3. Squeeze
     chosen_sig = None
@@ -326,6 +261,9 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         chosen_sig = sig_donchian
     elif sig_squeeze.action != "HOLD":
         chosen_sig = sig_squeeze
+
+    # Check for Futures Proxy Data Source
+    is_futures_proxy = bool(df.get("is_futures_proxy", pd.Series([False])).iloc[-1])
 
     if chosen_sig is None or chosen_sig.action == "HOLD":
         action = "HOLD"
@@ -344,6 +282,22 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             f"• 4. Indicators: RSI at {rsi_val:.1f} (Neutral/Wait), Buyer Flow {buyer_pct}% vs {seller_pct}%.\n"
             f"• 5. Action: Standing by for high-probability H1 EMA 20/50 test."
         )
+    elif is_futures_proxy and os.environ.get("ALLOW_PROXY_EXECUTION", "0") != "1":
+        # SAFETY VETO: Do not permit execution-qualified signals on futures proxy
+        action = "HOLD"
+        entry = current_price
+        sl = current_price
+        tp1 = current_price
+        tp2 = current_price
+        be_trigger = current_price
+        risk_dist = 0.0
+        active_strategy = f"{chosen_sig.strategy_name} (BLOCKED_FUTURES_PROXY)"
+        confidence = 0.0
+        why = (
+            "• 1. HOLD: Execution-qualified signals prohibited on Yahoo GC=F futures proxy.\n"
+            "• 2. Broker spot feed (MT5) is unavailable.\n"
+            "• 3. Risk Guard: Capital strictly preserved on sidelines (0 risk exposure)."
+        )
     else:
         action = chosen_sig.action
         entry = chosen_sig.entry
@@ -353,20 +307,20 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         be_trigger = chosen_sig.be_trigger
         risk_dist = chosen_sig.risk_pips / 10.0
         active_strategy = chosen_sig.strategy_name
-        confidence = round(ml_confidence, 1)
+        confidence = 65.0
         why = (
             f"• 1. Strategy Engine: `{active_strategy}` ({chosen_sig.action}).\n"
             f"• 2. Rationale: {chosen_sig.rationale}\n"
             f"• 3. Session: Active in `{session_name}`.\n"
             f"• 4. Risk Guard: SL buffered at ${sl:.2f} ({risk_dist:.2f} pts), BE at +20 pips.\n"
-            f"• 5. Model Score: {confidence}% (Dual XGB+LGBM Ensemble)."
+            f"• 5. Model Score: Pending Meta-Filter."
         )
 
     # Phase 2 ML Meta-Filter Expected R Evaluation (Strict +0.15R Hurdle with spread/slip cost drag)
     ml_verdict = meta_filter.evaluate_candidate(
         candidate_action=action,
         strategy_name=active_strategy,
-        df_m5=df,
+        df_m5=df_proc,
         h1_trend_bias=h1_trend_bias,
         h1_dist_ema50=h1_dist_ema50,
         risk_usd=max(1.0, risk_dist * 1.0),
@@ -375,12 +329,13 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     if action != "HOLD":
         confidence = round(ml_verdict.predicted_win_prob * 100, 1)
 
-    # Phase 2 Risk Governor Review (with Asian Session Chop Shield)
+    # Phase 2 Risk Governor Review (with Asian Session Chop Shield & Live Broker Spread)
+    quote = broker.get_symbol_quote(current_price)
     risk_approval = risk_governor.review_trade(
         equity=broker.equity,
         risk_pips=risk_dist * 10.0,
         stop_dist_usd=risk_dist,
-        current_spread_pips=24.0,
+        current_spread_pips=quote.spread_pips,
         open_positions_count=len(broker.open_positions),
         session_hour=curr_hour,
     )

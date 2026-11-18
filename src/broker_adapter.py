@@ -31,6 +31,61 @@ except ImportError:
     mt5 = None
 
 
+@dataclass(frozen=True)
+class SpreadQuote:
+    """
+    Standardized XAUUSD Broker Quote and Quotation Units.
+    Reconciles OctaTrader and MT5 specifications:
+    - Digits: 2 (Quote precision $0.01)
+    - Tick Size: $0.01 (1 point)
+    - Tick Value: $1.00 per standard lot (100 oz * $0.01)
+    - Pip Size: $0.10 (10 points)
+    - Pip Value: $10.00 per standard lot (100 oz * $0.10)
+    
+    Explicit Conversion Equations:
+    - spread_price_usd = ask - bid
+    - spread_points = spread_price_usd / 0.01 = round(spread_price_usd * 100.0, 1)
+    - spread_pips = spread_price_usd / 0.10 = round(spread_points / 10.0, 1)
+    - cost_per_standard_lot_usd = spread_price_usd * 100.0 = spread_points * 1.0 = spread_pips * 10.0
+    - cost_per_micro_lot_usd (0.01 lot) = spread_price_usd * 1.0 = spread_points * 0.01 = spread_pips * 0.10
+    """
+    bid: float
+    ask: float
+    spread_price_usd: float
+    spread_points: float
+    spread_pips: float
+    time: str
+    is_broker_confirmed: bool = False
+    quote_source: str = "OCTA_SHADOW_MODEL"
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    @classmethod
+    def from_bid_ask(
+        cls,
+        bid: float,
+        ask: float,
+        time_str: str | None = None,
+        is_broker_confirmed: bool = False,
+        quote_source: str = "OCTA_SHADOW_MODEL",
+    ) -> "SpreadQuote":
+        spread_usd = round(ask - bid, 4)
+        spread_pts = round(spread_usd / 0.01, 1)
+        spread_pps = round(spread_usd / 0.10, 1)
+        t = time_str or datetime.now(timezone.utc).isoformat()
+        return cls(
+            bid=round(bid, 2),
+            ask=round(ask, 2),
+            spread_price_usd=spread_usd,
+            spread_points=spread_pts,
+            spread_pips=spread_pps,
+            time=t,
+            is_broker_confirmed=is_broker_confirmed,
+            quote_source=quote_source,
+        )
+
+
 @dataclass
 class BrokerPosition:
     ticket: str
@@ -129,33 +184,33 @@ class OctaBrokerAdapter:
     def get_account_equity(self) -> float:
         return self.equity
 
-    def get_symbol_quote(self, current_close: float) -> dict:
-        """Returns live bid, ask, and spread modeling."""
+    def get_symbol_quote(self, current_close: float) -> SpreadQuote:
+        """Returns live bid, ask, and spread modeling with explicit quotation units."""
         if self.is_mt5_live and mt5 is not None:
             try:
                 tick = mt5.symbol_info_tick(self.symbol)
-                if tick is not None:
-                    return {
-                        "bid": tick.bid,
-                        "ask": tick.ask,
-                        "spread_points": (tick.ask - tick.bid) * 100,
-                        "spread_pips": (tick.ask - tick.bid) * 10,
-                        "time": str(datetime.fromtimestamp(tick.time, tz=timezone.utc)),
-                    }
-            except Exception:
-                pass
+                if tick is not None and tick.ask > tick.bid > 0:
+                    return SpreadQuote.from_bid_ask(
+                        bid=tick.bid,
+                        ask=tick.ask,
+                        time_str=str(datetime.fromtimestamp(tick.time, tz=timezone.utc)),
+                        is_broker_confirmed=True,
+                        quote_source="BROKER_MT5_SPOT",
+                    )
+            except Exception as e:
+                logger.warning("MT5 live quote fetch error: %s", e)
 
-        # Octa authentic floating spread model: typical gold spread ~20-28 pips ($0.20 - $0.28)
-        half_spread = 0.12  # $0.12 half-spread ($0.24 total spread = 24 pips)
-        bid = round(current_close - half_spread, 2)
-        ask = round(current_close + half_spread, 2)
-        return {
-            "bid": bid,
-            "ask": ask,
-            "spread_points": 24.0,
-            "spread_pips": 24.0,
-            "time": datetime.now(timezone.utc).isoformat(),
-        }
+        # Octa authentic floating spread model: typical gold spread ~4.2 points / $0.42 (4.2 pips)
+        half_spread_usd = 0.21  # $0.21 half-spread ($0.42 total spread)
+        bid = round(current_close - half_spread_usd, 2)
+        ask = round(current_close + half_spread_usd, 2)
+        return SpreadQuote.from_bid_ask(
+            bid=bid,
+            ask=ask,
+            time_str=datetime.now(timezone.utc).isoformat(),
+            is_broker_confirmed=False,
+            quote_source="OCTA_SHADOW_MODEL_TYPICAL_SPREAD",
+        )
 
     def execute_order(
         self,

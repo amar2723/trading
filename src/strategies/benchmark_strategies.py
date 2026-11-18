@@ -46,13 +46,16 @@ class H1TrendM5PullbackStrategy:
         # Causal H1 Trend
         h1_trend_bull = False
         h1_trend_bear = False
-        if df_h1 is not None and len(df_h1) >= 20:
-            h1_closed = df_h1.iloc[:-1] # Completed H1 bars only
+        if "h1_trend_bias" in df_m5.columns:
+            bias_val = int(df_m5["h1_trend_bias"].iloc[-1])
+            h1_trend_bull = (bias_val == 1)
+            h1_trend_bear = (bias_val == -1)
+        elif df_h1 is not None and len(df_h1) >= 20:
+            h1_closed = df_h1.iloc[:-1]  # Completed H1 bars only
             h1_c = h1_closed["close"].values
             h1_e50 = float(pd.Series(h1_c).ewm(span=50).mean().iloc[-1])
-            h1_e200 = float(pd.Series(h1_c).ewm(span=200).mean().iloc[-1])
-            h1_trend_bull = (h1_c[-1] > h1_e50) and (h1_e50 >= h1_e200)
-            h1_trend_bear = (h1_c[-1] < h1_e50) and (h1_e50 <= h1_e200)
+            h1_trend_bull = float(h1_c[-1]) > h1_e50
+            h1_trend_bear = float(h1_c[-1]) < h1_e50
 
         # M5 Value Zone EMAs
         m5_e20 = float(pd.Series(close).ewm(span=20).mean().iloc[-1])
@@ -157,11 +160,15 @@ class DonchianBreakoutStrategy:
         # Causal H1 Trend
         h1_trend_bull = False
         h1_trend_bear = False
-        if df_h1 is not None and len(df_h1) >= 20:
+        if "h1_trend_bias" in df_m5.columns:
+            bias_val = int(df_m5["h1_trend_bias"].iloc[-1])
+            h1_trend_bull = (bias_val == 1)
+            h1_trend_bear = (bias_val == -1)
+        elif df_h1 is not None and len(df_h1) >= 20:
             h1_c = df_h1.iloc[:-1]["close"].values
             h1_e50 = float(pd.Series(h1_c).ewm(span=50).mean().iloc[-1])
-            h1_trend_bull = h1_c[-1] > h1_e50
-            h1_trend_bear = h1_c[-1] < h1_e50
+            h1_trend_bull = float(h1_c[-1]) > h1_e50
+            h1_trend_bear = float(h1_c[-1]) < h1_e50
 
         # 20-period Donchian Channels (shifted by 1 to prevent lookahead)
         donch_high = float(pd.Series(high).rolling(20).max().shift(1).iloc[-1])
@@ -224,11 +231,15 @@ class VolatilitySqueezeStrategy:
         # Causal H1 Trend
         h1_trend_bull = False
         h1_trend_bear = False
-        if df_h1 is not None and len(df_h1) >= 20:
+        if "h1_trend_bias" in df_m5.columns:
+            bias_val = int(df_m5["h1_trend_bias"].iloc[-1])
+            h1_trend_bull = (bias_val == 1)
+            h1_trend_bear = (bias_val == -1)
+        elif df_h1 is not None and len(df_h1) >= 20:
             h1_c = df_h1.iloc[:-1]["close"].values
             h1_e50 = float(pd.Series(h1_c).ewm(span=50).mean().iloc[-1])
-            h1_trend_bull = h1_c[-1] > h1_e50
-            h1_trend_bear = h1_c[-1] < h1_e50
+            h1_trend_bull = float(h1_c[-1]) > h1_e50
+            h1_trend_bear = float(h1_c[-1]) < h1_e50
 
         # Bollinger Bands (20, 2.0)
         s_close = pd.Series(close)

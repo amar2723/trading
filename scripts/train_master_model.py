@@ -22,6 +22,8 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
 import xgboost as xgb
 
+from src.feature_pipeline import compute_indicator_dataframe
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -38,22 +40,9 @@ def build_master_dataset() -> tuple[pd.DataFrame, pd.Series]:
     df_h1 = pd.read_csv(h1_path)
     logger.info("Loaded %d M5 bars and %d H1 bars", len(df_m5), len(df_h1))
 
-    # 1. Causal Higher-Timeframe (H1) Integration
-    df_h1["timestamp"] = pd.to_datetime(df_h1["timestamp"])
-    df_h1 = df_h1.sort_values("timestamp").reset_index(drop=True)
-    df_h1["h1_ema_50"] = df_h1["close"].ewm(span=50).mean()
-    df_h1["h1_ema_200"] = df_h1["close"].ewm(span=200).mean()
-    
-    # Strictly lag H1 by 1 closed bar: M5 bars only ever observe completed past H1 bars
-    df_h1["htf_trend_bias"] = np.where(df_h1["close"] > df_h1["h1_ema_200"], 1, -1)
-    df_h1["htf_trend_bias"] = df_h1["htf_trend_bias"].shift(1)
-    df_h1["h1_dist_ema50"] = ((df_h1["close"] - df_h1["h1_ema_50"]) / df_h1["h1_ema_50"] * 100).shift(1)
-    df_h1_sub = df_h1[["timestamp", "htf_trend_bias", "h1_dist_ema50"]].dropna()
-
-    df_m5["timestamp"] = pd.to_datetime(df_m5["timestamp"])
-    df_m5 = df_m5.sort_values("timestamp").reset_index(drop=True)
-    # Causal backward asof merge
-    df_m5 = pd.merge_asof(df_m5, df_h1_sub, on="timestamp", direction="backward")
+    # 1. Causal Higher-Timeframe (H1) Integration & Shared Feature Pipeline
+    df_m5 = compute_indicator_dataframe(df_m5, df_h1)
+    df_m5["htf_trend_bias"] = df_m5["h1_trend_bias"]
 
     close = df_m5["close"].values
     high = df_m5["high"].values
@@ -62,10 +51,9 @@ def build_master_dataset() -> tuple[pd.DataFrame, pd.Series]:
     timestamps = df_m5["timestamp"]
     n = len(df_m5)
 
-    # 2. M5 Indicators without Look-Ahead (.bfill strictly eliminated)
+    # 2. Additional indicators for legacy training format
     df_m5["ema_9"] = pd.Series(close).ewm(span=9).mean()
     df_m5["ema_21"] = pd.Series(close).ewm(span=21).mean()
-    df_m5["ema_50"] = pd.Series(close).ewm(span=50).mean()
     df_m5["dist_ema_50"] = (df_m5["close"] - df_m5["ema_50"]) / df_m5["ema_50"] * 100
 
     # Session Killzones
