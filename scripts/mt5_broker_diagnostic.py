@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -208,16 +209,21 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0, 
     # Live Quote & Freshness
     tick = _mt5.symbol_info_tick(selected_symbol)
     if tick is not None and getattr(tick, "ask", 0) > getattr(tick, "bid", 0) > 0:
+        now_ts = time.time()
+        # MT5 tick.time is reported in broker server time (typically EET / UTC+2 or UTC+3).
+        # Normalize to UTC by calculating hourly server offset.
+        server_offset_sec = round((tick.time - now_ts) / 3600.0) * 3600
+        tick_utc_ts = tick.time - server_offset_sec
+        tick_time_utc = datetime.fromtimestamp(tick_utc_ts, tz=timezone.utc)
+        latency_sec = round(now_ts - tick_utc_ts, 2)
+
         quote = SpreadQuote.from_bid_ask(
             bid=tick.bid,
             ask=tick.ask,
-            time_str=str(datetime.fromtimestamp(tick.time, tz=timezone.utc)),
+            time_str=str(tick_time_utc),
             is_broker_confirmed=True,
             quote_source="BROKER_MT5_SPOT",
         )
-        tick_time = datetime.fromtimestamp(tick.time, tz=timezone.utc)
-        now_utc = datetime.now(timezone.utc)
-        latency_sec = round((now_utc - tick_time).total_seconds(), 2)
 
         result["live_quote"] = {
             "bid": quote.bid,
@@ -228,6 +234,7 @@ def run_broker_diagnostic(symbol: str = "XAUUSD", timeout_seconds: float = 4.0, 
             "spread_pips": quote.spread_pips,
             "tick_time_utc": quote.time,
             "quote_time": quote.time,
+            "server_timezone_offset_hours": round(server_offset_sec / 3600.0, 1),
             "latency_seconds": latency_sec,
             "is_fresh": (0.0 <= latency_sec <= 30.0),
         }
