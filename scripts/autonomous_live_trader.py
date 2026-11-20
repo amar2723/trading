@@ -431,19 +431,37 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
 
 def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str:
     wl = setup.get("watchlist", {})
+    sched = wl.get("timing_schedule", {})
     nearest_bsl = wl.get("nearest_bsl")
     nearest_ssl = wl.get("nearest_ssl")
     fv = wl.get("fair_value_targets", {})
     vwap_val = fv.get("session_vwap")
 
-    bsl_str = f"${nearest_bsl['price']:.2f} ({nearest_bsl['level_type']}) — {nearest_bsl['distance_pips']}p away" if nearest_bsl else "None"
-    ssl_str = f"${nearest_ssl['price']:.2f} ({nearest_ssl['level_type']}) — {nearest_ssl['distance_pips']}p away" if nearest_ssl else "None"
+    cur_time_str = f"{sched.get('current_time_utc', '')} | {sched.get('current_time_ist', '')}" if sched else setup.get("time", "")
+    active_win = sched.get("active_window", setup.get("session", ""))
+    next_win = sched.get("next_window", "Next Session")
+
+    bsl_str = (
+        f"${nearest_bsl['price']:.2f} ({nearest_bsl['level_type']}) — `{nearest_bsl['distance_pips']}p away`\n"
+        f"  ↳ 🎯 *Trigger Zone*: `${nearest_bsl['sweep_min_trigger']:.2f} – ${nearest_bsl['sweep_max_trigger']:.2f}`\n"
+        f"  ↳ ⏳ *Estimated Timing*: `{nearest_bsl.get('eta_display', 'N/A')}`"
+    ) if nearest_bsl else "None"
+
+    ssl_str = (
+        f"${nearest_ssl['price']:.2f} ({nearest_ssl['level_type']}) — `{nearest_ssl['distance_pips']}p away`\n"
+        f"  ↳ 🎯 *Trigger Zone*: `${nearest_ssl['sweep_min_trigger']:.2f} – ${nearest_ssl['sweep_max_trigger']:.2f}`\n"
+        f"  ↳ ⏳ *Estimated Timing*: `{nearest_ssl.get('eta_display', 'N/A')}`"
+    ) if nearest_ssl else "None"
+
     vwap_str = f"${vwap_val:.2f}" if (vwap_val and vwap_val > 0) else "N/A"
 
     wl_section = (
-        f"🎯 *PRE-SWEEP LIQUIDITY MAP (RESTING POOLS)*:\n"
-        f"• 🔴 *Buy-Side (BSL / Highs)*: `{bsl_str}`\n"
-        f"• 🟢 *Sell-Side (SSL / Lows)*: `{ssl_str}`\n"
+        f"🎯 *INSTITUTIONAL LIQUIDITY MAP & TIMING FORECAST*:\n"
+        f"• 🕒 *Current Time*: `{cur_time_str}`\n"
+        f"• 🌐 *Active Window*: `{active_win}`\n"
+        f"• ⏳ *Next Window*: `{next_win}`\n\n"
+        f"• 🔴 *Buy-Side Target (BSL / Highs)*:\n  {bsl_str}\n"
+        f"• 🟢 *Sell-Side Target (SSL / Lows)*:\n  {ssl_str}\n"
         f"• ⚖️ *Fair Value (VWAP)*: `{vwap_str}`\n"
         f"• 🛡️ *Filter Mode*: `EXCLUSIVE LIQUIDITY SWEEPS ONLY`\n"
     )
@@ -475,8 +493,9 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"{icon} *{title_prefix} ({setup['action']})*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 *Asset*: XAUUSD (Gold - M5 Live)\n"
-        f"💵 *Live Market Price*: `${setup['price']:.2f}`\n"
-        f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n\n"
+        f"🕒 *Trigger Time*: `{cur_time_str}`\n"
+        f"🌐 *Session Window*: `{active_win}`\n"
+        f"💵 *Live Market Price*: `${setup['price']:.2f}`\n\n"
         f"📍 *EXACT ENTRY*: `${setup['entry']:.2f}`\n"
         f"🛑 *STOP LOSS (SL)*: `${setup['sl']:.2f}` (ATR-Buffered)\n"
         f"🛡️ *BREAK-EVEN TRIGGER*: `${setup['be_trigger']:.2f}` (+20 pips ➔ Move SL to Entry)\n"

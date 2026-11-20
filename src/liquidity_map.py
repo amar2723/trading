@@ -510,12 +510,53 @@ class LiquidityMap:
                 established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area Low"
             ))
 
+        # Timing & Institutional Killzone Schedule
+        ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True)
+        ts_ist = ts + pd.Timedelta(hours=5, minutes=30)
+        curr_hour = ts.hour
+
+        if 0 <= curr_hour < 7:
+            active_window = "ASIAN ACCUMULATION (00:00 - 06:00 UTC / 05:30 - 11:30 IST)"
+            next_window = "LONDON JUDAS SWEEP (07:00 - 10:00 UTC / 12:30 - 15:30 IST)"
+            next_window_name = "LONDON OPEN (12:30 IST)"
+        elif 7 <= curr_hour < 10:
+            active_window = "LONDON JUDAS SWEEP (07:00 - 10:00 UTC / 12:30 - 15:30 IST)"
+            next_window = "NEW YORK JUDAS SWEEP (12:00 - 16:00 UTC / 17:30 - 21:30 IST)"
+            next_window_name = "NY OPEN (17:30 IST)"
+        elif 10 <= curr_hour < 12:
+            active_window = "LONDON MIDDAY CHOP (10:00 - 12:00 UTC / 15:30 - 17:30 IST)"
+            next_window = "NEW YORK JUDAS SWEEP (12:00 - 16:00 UTC / 17:30 - 21:30 IST)"
+            next_window_name = "NY OPEN (17:30 IST)"
+        elif 12 <= curr_hour < 16:
+            active_window = "NEW YORK JUDAS SWEEP (12:00 - 16:00 UTC / 17:30 - 21:30 IST)"
+            next_window = "NY CLOSE / LONDON FIX (16:00 - 20:00 UTC / 21:30 - 01:30 IST)"
+            next_window_name = "NY AFTERNOON (21:30 IST)"
+        else:
+            active_window = "NY CLOSE / POST-MARKET (16:00 - 21:00 UTC / 21:30 - 02:30 IST)"
+            next_window = "ASIAN ACCUMULATION (00:00 - 06:00 UTC / 05:30 - 11:30 IST)"
+            next_window_name = "ASIAN OPEN (05:30 IST)"
+
         bsl_list = []
         ssl_list = []
 
         for lvl in levels:
             dist_usd = round(abs(lvl.price - current_price), 2)
             dist_pips = round(dist_usd * 10.0, 1)
+
+            est_bars = max(1, int(round(dist_usd / max(atr_val, 0.50))))
+            est_minutes = est_bars * 5
+            est_time_utc = ts + pd.Timedelta(minutes=est_minutes)
+            est_time_ist = ts_ist + pd.Timedelta(minutes=est_minutes)
+
+            if dist_usd <= (atr_val * 1.2):
+                timing_status = "IMMINENT_TEST"
+                timing_eta = f"IMMINENT (~{est_minutes}m / {est_time_ist.strftime('%H:%M IST')})"
+            elif dist_usd <= (atr_val * 3.5):
+                timing_status = "APPROACHING"
+                timing_eta = f"APPROACHING (~{est_minutes}m / {est_time_ist.strftime('%H:%M IST')})"
+            else:
+                timing_status = "UPCOMING_SESSION"
+                timing_eta = f"Projected {next_window_name} (~{est_minutes // 60}h {est_minutes % 60}m / {est_time_ist.strftime('%H:%M IST')})"
 
             pool_entry = {
                 "level_id": lvl.level_id,
@@ -527,6 +568,11 @@ class LiquidityMap:
                 "evidence": lvl.evidence,
                 "sweep_min_trigger": round(lvl.price + (self.min_sweep_atr_mult * atr_val) if lvl.price > current_price else lvl.price - (self.min_sweep_atr_mult * atr_val), 2),
                 "sweep_max_trigger": round(lvl.price + (self.max_sweep_atr_mult * atr_val) if lvl.price > current_price else lvl.price - (self.max_sweep_atr_mult * atr_val), 2),
+                "timing_status": timing_status,
+                "eta_minutes": est_minutes,
+                "eta_display": timing_eta,
+                "est_arrival_ist": est_time_ist.strftime("%H:%M IST"),
+                "est_arrival_utc": est_time_utc.strftime("%H:%M UTC"),
             }
 
             if lvl.price > current_price:
@@ -545,6 +591,12 @@ class LiquidityMap:
         return {
             "current_price": current_price,
             "atr_14": round(atr_val, 2),
+            "timing_schedule": {
+                "current_time_utc": ts.strftime("%Y-%m-%d %H:%M UTC"),
+                "current_time_ist": ts_ist.strftime("%Y-%m-%d %H:%M IST"),
+                "active_window": active_window,
+                "next_window": next_window,
+            },
             "nearest_bsl": nearest_bsl,
             "nearest_ssl": nearest_ssl,
             "all_bsl_pools": bsl_list,
