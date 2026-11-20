@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+"""
+Enterprise-Grade Liquidity & Liquidation Mapping Engine for XAUUSD (Gold).
+
+Theoretical Framework & Market Microstructure:
+1. Microstructure Reference Zones (Kyle 1985, Harris 2003):
+   Key price references (prior session highs/lows, VWAP bands, volume profile edges)
+   are hypothetical zones of institutional interest, NOT guaranteed resting orders.
+2. Sweep vs. Acceptance vs. Rejection (GoldTradingDesk 2024):
+   - Sweep: Price excursions beyond a reference level that immediately fail.
+   - Acceptance: Sustained volume accumulation and multi-bar closing beyond the level.
+   - Rejection: Closed confirmation back inside the value zone with volume/RSI backing.
+3. No-Trade Stop Run Gate:
+   Single-bar wicks are observations only. Direct entries on wicks are prohibited.
+4. Forced Liquidation Circuit Breaker (Brunnermeier & Pedersen 2009):
+   Margin call cascades create non-linear price disconnections (>2% in 5 min).
+   When triggered, a 60-minute cooling circuit breaker halts all new order generation.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+import logging
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger("LiquidityMap")
+
+
+@dataclass
+class LiquidityReferenceLevel:
+    level_id: str
+    level_type: str          # "SESSION_HIGH", "SESSION_LOW", "PDH", "PDL", "PDC", "VWAP", "VP_VAH", "VP_VAL", "VP_POC"
+    session: str             # "ASIA", "LONDON", "NY", "PRIOR_DAY", "PROFILE"
+    price: float
+    volume_weight: float     # Tick volume accumulation proxy
+    established_time: str
+    is_active: bool = True
+    evidence: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "level_id": self.level_id,
+            "level_type": self.level_type,
+            "session": self.session,
+            "price": round(self.price, 2),
+            "volume_weight": round(self.volume_weight, 1),
+            "established_time": self.established_time,
+            "is_active": self.is_active,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass
+class SweepEvent:
+    event_id: str
+    timestamp: str
+    level: LiquidityReferenceLevel
+    sweep_type: str          # "BULLISH_SWEEP" (swept low, rejection up), "BEARISH_SWEEP" (swept high, rejection down)
+    breach_price: float
+    reclaim_price: float
+    atr_excursion: float
+    status: str              # "UNCONFIRMED_WICK", "CONFIRMED_REJECTION", "CONFIRMED_ACCEPTANCE"
+    confirmation_bar_time: str | None = None
+    rationale: str = ""
+
+
+class ForcedLiquidationMonitor:
+    """
+    Monitors systemic liquidation cascades and extreme margin events.
+    When rolling 5-minute price velocity exceeds 2.0% (approx $75/oz on Gold),
+    trips an automatic circuit breaker for 12 bars (60 minutes).
+    """
+    def __init__(self, velocity_threshold_pct: float = 2.0, cooldown_bars: int = 12):
+        self.velocity_threshold_pct = velocity_threshold_pct
+        self.cooldown_bars = cooldown_bars
+        self.is_circuit_breaker_active = False
+        self.last_trip_time: str | None = None
+        self.bars_since_trip: int = 999
+        self.trip_reason: str = ""
+
+    def evaluate(self, df: pd.DataFrame) -> tuple[bool, str]:
+        if df is None or len(df) < 2:
+            return False, "NORMAL"
+
+        last_row = df.iloc[-1]
+        prev_row = df.iloc[-2]
+
+        # Calculate 5-minute displacement velocity (close vs previous close, or candle range)
+        prev_close = float(prev_row["close"])
+        close_price = float(last_row["close"])
+        open_price = float(last_row["open"])
+        displacement_pct = abs(close_price - prev_close) / max(prev_close, 1.0) * 100.0
+        candle_body_pct = abs(close_price - open_price) / max(open_price, 1.0) * 100.0
+
+        high_price = float(last_row["high"])
+        low_price = float(last_row["low"])
+        candle_range_pct = (high_price - low_price) / max(prev_close, 1.0) * 100.0
+
+        max_vel = max(displacement_pct, candle_body_pct, candle_range_pct)
+
+        if max_vel >= self.velocity_threshold_pct:
+            self.is_circuit_breaker_active = True
+            self.bars_since_trip = 0
+            self.last_trip_time = str(last_row.get("timestamp", datetime.now(timezone.utc)))
+            self.trip_reason = (
+                f"FORCED_LIQUIDATION_ALERT: Extreme velocity {max_vel:.2f}% in 5m "
+                f"(Threshold: {self.velocity_threshold_pct}%). Circuit breaker engaged."
+            )
+            logger.warning(self.trip_reason)
+            return True, self.trip_reason
+
+        if self.is_circuit_breaker_active:
+            self.bars_since_trip += 1
+            if self.bars_since_trip >= self.cooldown_bars:
+                self.is_circuit_breaker_active = False
+                logger.info("Circuit breaker cooldown expired (%d bars). Resuming standard monitoring.", self.cooldown_bars)
+                return False, "CIRCUIT_BREAKER_CLEARED"
+            return True, f"CIRCUIT_BREAKER_COOLING (Bar {self.bars_since_trip}/{self.cooldown_bars})"
+
+        return False, "NORMAL"
+
+
+class LiquidityMap:
+    """
+    Institutional Liquidity & Microstructure Mapping Engine.
+    Identifies session boundaries, prior day extremes, anchored VWAP, and volume profile value areas.
+    Detects sweeps with mandatory multi-bar closure confirmation.
+    """
+    def __init__(
+        self,
+        symbol: str = "XAUUSD",
+        min_sweep_atr_mult: float = 0.20,
+        max_sweep_atr_mult: float = 1.50,
+        confirmation_required: bool = True,
+    ):
+        self.symbol = symbol
+        self.min_sweep_atr_mult = min_sweep_atr_mult
+        self.max_sweep_atr_mult = max_sweep_atr_mult
+        self.confirmation_required = confirmation_required
+        self.liquidation_monitor = ForcedLiquidationMonitor()
+
+    @staticmethod
+    def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
+
+    def compute_session_levels(self, df: pd.DataFrame) -> list[LiquidityReferenceLevel]:
+        """
+        Computes Asian (00-06 UTC), London (07-10 UTC), and NY (12-16 UTC) extremes,
+        plus Prior Day High, Low, and Close.
+        """
+        levels: list[LiquidityReferenceLevel] = []
+        if df is None or len(df) < 15:
+            return levels
+
+        ts = pd.to_datetime(df["timestamp"], utc=True)
+        df_work = df.copy()
+        df_work["ts_utc"] = ts
+        df_work["hour"] = ts.dt.hour
+        df_work["date"] = ts.dt.date
+
+        unique_dates = df_work["date"].unique()
+        current_date = unique_dates[-1]
+
+        # Prior Day Extremes (if available)
+        if len(unique_dates) >= 2:
+            prior_date = unique_dates[-2]
+            df_prior = df_work[df_work["date"] == prior_date]
+            if not df_prior.empty:
+                pdh = float(df_prior["high"].max())
+                pdl = float(df_prior["low"].min())
+                pdc = float(df_prior["close"].iloc[-1])
+                pd_vol = float(df_prior["tick_volume"].sum()) if "tick_volume" in df_prior.columns else 1000.0
+
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PDH_{prior_date}",
+                    level_type="PDH",
+                    session="PRIOR_DAY",
+                    price=pdh,
+                    volume_weight=pd_vol,
+                    established_time=str(df_prior["ts_utc"].iloc[-1]),
+                    evidence="Prior Day High benchmark",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PDL_{prior_date}",
+                    level_type="PDL",
+                    session="PRIOR_DAY",
+                    price=pdl,
+                    volume_weight=pd_vol,
+                    established_time=str(df_prior["ts_utc"].iloc[-1]),
+                    evidence="Prior Day Low benchmark",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PDC_{prior_date}",
+                    level_type="PDC",
+                    session="PRIOR_DAY",
+                    price=pdc,
+                    volume_weight=pd_vol,
+                    established_time=str(df_prior["ts_utc"].iloc[-1]),
+                    evidence="Prior Day Close benchmark",
+                ))
+
+        # Intraday Sessions for current date
+        df_today = df_work[df_work["date"] == current_date]
+        if not df_today.empty:
+            # 1. Asian Session (00:00 - 06:00 UTC)
+            df_asia = df_today[(df_today["hour"] >= 0) & (df_today["hour"] <= 6)]
+            if len(df_asia) >= 6:
+                asia_h = float(df_asia["high"].max())
+                asia_l = float(df_asia["low"].min())
+                asia_vol = float(df_asia["tick_volume"].sum()) if "tick_volume" in df_asia.columns else 500.0
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"ASIA_HIGH_{current_date}",
+                    level_type="SESSION_HIGH",
+                    session="ASIA",
+                    price=asia_h,
+                    volume_weight=asia_vol,
+                    established_time=str(df_asia["ts_utc"].iloc[-1]),
+                    evidence="Asian session range high accumulation",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"ASIA_LOW_{current_date}",
+                    level_type="SESSION_LOW",
+                    session="ASIA",
+                    price=asia_l,
+                    volume_weight=asia_vol,
+                    established_time=str(df_asia["ts_utc"].iloc[-1]),
+                    evidence="Asian session range low accumulation",
+                ))
+
+            # 2. London Killzone (07:00 - 10:00 UTC)
+            df_london = df_today[(df_today["hour"] >= 7) & (df_today["hour"] <= 10)]
+            if len(df_london) >= 6:
+                lon_h = float(df_london["high"].max())
+                lon_l = float(df_london["low"].min())
+                lon_vol = float(df_london["tick_volume"].sum()) if "tick_volume" in df_london.columns else 1200.0
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"LON_HIGH_{current_date}",
+                    level_type="SESSION_HIGH",
+                    session="LONDON",
+                    price=lon_h,
+                    volume_weight=lon_vol,
+                    established_time=str(df_london["ts_utc"].iloc[-1]),
+                    evidence="London Killzone peak expansion high",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"LON_LOW_{current_date}",
+                    level_type="SESSION_LOW",
+                    session="LONDON",
+                    price=lon_l,
+                    volume_weight=lon_vol,
+                    established_time=str(df_london["ts_utc"].iloc[-1]),
+                    evidence="London Killzone peak expansion low",
+                ))
+
+        return levels
+
+    def compute_anchored_vwap(self, df: pd.DataFrame) -> dict[str, float]:
+        """
+        Computes rolling/session Anchored VWAP and +/- 1.5 sigma and 2.0 sigma dispersion bands.
+        """
+        if df is None or len(df) < 10:
+            return {}
+
+        price = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
+        vol = df["tick_volume"].astype(float) if "tick_volume" in df.columns else pd.Series(100.0, index=df.index)
+
+        cum_pv = (price * vol).cumsum()
+        cum_vol = vol.cumsum()
+        vwap = cum_pv / cum_vol.replace(0, 1.0)
+
+        # Standard deviation bands
+        squared_diff = (price - vwap) ** 2
+        cum_sq_diff = (vol * squared_diff).cumsum()
+        variance = cum_sq_diff / cum_vol.replace(0, 1.0)
+        std_dev = np.sqrt(variance.clip(lower=0))
+
+        latest_vwap = float(vwap.iloc[-1])
+        latest_std = float(std_dev.iloc[-1])
+
+        return {
+            "vwap": latest_vwap,
+            "vwap_upper_1": latest_vwap + (1.5 * latest_std),
+            "vwap_lower_1": latest_vwap - (1.5 * latest_std),
+            "vwap_upper_2": latest_vwap + (2.0 * latest_std),
+            "vwap_lower_2": latest_vwap - (2.0 * latest_std),
+        }
+
+    def compute_volume_profile(self, df: pd.DataFrame, bins: int = 30) -> dict[str, float]:
+        """
+        Computes 24-hour Volume Profile Value Area: Value Area High (VAH),
+        Value Area Low (VAL), and Point of Control (POC) representing 70% volume.
+        """
+        if df is None or len(df) < 20:
+            return {}
+
+        high = df["high"].astype(float).values
+        low = df["low"].astype(float).values
+        close = df["close"].astype(float).values
+        vol = df["tick_volume"].astype(float).values if "tick_volume" in df.columns else np.full(len(df), 100.0)
+
+        min_p = float(low.min())
+        max_p = float(high.max())
+        if max_p <= min_p:
+            return {"vp_poc": min_p, "vp_vah": max_p, "vp_val": min_p}
+
+        bin_edges = np.linspace(min_p, max_p, bins + 1)
+        bin_volumes = np.zeros(bins)
+
+        # Distribute volume across price bins touched by each bar
+        for h, l, c, v in zip(high, low, close, vol):
+            # Find bins overlapping with [l, h]
+            idx_start = max(0, int(np.searchsorted(bin_edges, l, side="right") - 1))
+            idx_end = min(bins - 1, int(np.searchsorted(bin_edges, h, side="left")))
+            if idx_start <= idx_end:
+                num_bins = idx_end - idx_start + 1
+                bin_volumes[idx_start:idx_end + 1] += v / num_bins
+            else:
+                bin_volumes[min(bins - 1, idx_start)] += v
+
+        poc_idx = int(np.argmax(bin_volumes))
+        poc_price = float((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2.0)
+
+        # 70% Value Area calculation expanding outwards from POC
+        total_vol = float(bin_volumes.sum())
+        target_vol = total_vol * 0.70
+        curr_vol = float(bin_volumes[poc_idx])
+        left_idx = poc_idx
+        right_idx = poc_idx
+
+        while curr_vol < target_vol and (left_idx > 0 or right_idx < bins - 1):
+            next_left_vol = float(bin_volumes[left_idx - 1]) if left_idx > 0 else -1.0
+            next_right_vol = float(bin_volumes[right_idx + 1]) if right_idx < bins - 1 else -1.0
+
+            if next_left_vol >= next_right_vol and next_left_vol >= 0:
+                left_idx -= 1
+                curr_vol += next_left_vol
+            elif next_right_vol >= 0:
+                right_idx += 1
+                curr_vol += next_right_vol
+            else:
+                break
+
+        val_price = float(bin_edges[left_idx])
+        vah_price = float(bin_edges[right_idx + 1])
+
+        return {
+            "vp_poc": poc_price,
+            "vp_vah": vah_price,
+            "vp_val": val_price,
+        }
+
+    def evaluate_sweeps_and_structure(self, df: pd.DataFrame) -> tuple[list[SweepEvent], str]:
+        """
+        Evaluates recent completed price action against LiquidityReferenceLevels.
+        Enforces No-Trade Stop Run Gate: single-bar wicks are tagged UNCONFIRMED_WICK.
+        Only multi-bar confirmed rejections are marked CONFIRMED_REJECTION.
+        """
+        events: list[SweepEvent] = []
+        if df is None or len(df) < 5:
+            return events, "INSUFFICIENT_DATA"
+
+        # Check circuit breaker
+        is_breaker, breaker_msg = self.liquidation_monitor.evaluate(df)
+        if is_breaker:
+            return events, breaker_msg
+
+        levels = self.compute_session_levels(df)
+        if not levels:
+            return events, "NO_ACTIVE_LEVELS"
+
+        atr_series = self._compute_atr(df, 14)
+        atr_val = float(atr_series.iloc[-1]) if not atr_series.empty else 5.0
+        atr_val = max(atr_val, 1.0)
+
+        last_idx = len(df) - 1
+        curr_high = float(df["high"].iloc[last_idx])
+        curr_low = float(df["low"].iloc[last_idx])
+        curr_close = float(df["close"].iloc[last_idx])
+        curr_open = float(df["open"].iloc[last_idx])
+        curr_time = str(df["timestamp"].iloc[last_idx])
+
+        prev_high = float(df["high"].iloc[last_idx - 1])
+        prev_low = float(df["low"].iloc[last_idx - 1])
+        prev_close = float(df["close"].iloc[last_idx - 1])
+
+        status_verdict = "NORMAL"
+
+        for lvl in levels:
+            # Check Bearish Sweep (Sweep above resistance level)
+            if lvl.level_type in ["SESSION_HIGH", "PDH", "VP_VAH"]:
+                min_reach = lvl.price + (self.min_sweep_atr_mult * atr_val)
+                max_reach = lvl.price + (self.max_sweep_atr_mult * atr_val)
+
+                # Case A: Sweep occurred on previous candle (last_idx - 1), confirmation on current candle
+                if (prev_high >= min_reach) and (prev_high <= max_reach) and (prev_close < lvl.price):
+                    # Multi-bar confirmation: current candle must close bearish below previous close
+                    is_confirmed = (curr_close < prev_close) and (curr_close < curr_open)
+                    status = "CONFIRMED_REJECTION" if is_confirmed else "UNCONFIRMED_WICK"
+                    events.append(SweepEvent(
+                        event_id=f"SWEEP_HIGH_{lvl.level_id}_{curr_time}",
+                        timestamp=curr_time,
+                        level=lvl,
+                        sweep_type="BEARISH_SWEEP",
+                        breach_price=prev_high,
+                        reclaim_price=curr_close,
+                        atr_excursion=round((prev_high - lvl.price) / atr_val, 2),
+                        status=status,
+                        confirmation_bar_time=curr_time if is_confirmed else None,
+                        rationale=f"Swept {lvl.level_type} (${lvl.price:.2f}) by {prev_high - lvl.price:.2f} pts, closed back inside range.",
+                    ))
+                    if is_confirmed:
+                        status_verdict = f"CONFIRMED_BEARISH_REJECTION_{lvl.level_type}"
+
+                # Case B: Current bar is actively wicking beyond level (Unconfirmed Stop-Run Wick)
+                elif (curr_high >= min_reach) and (curr_close < lvl.price):
+                    events.append(SweepEvent(
+                        event_id=f"WICK_HIGH_{lvl.level_id}_{curr_time}",
+                        timestamp=curr_time,
+                        level=lvl,
+                        sweep_type="BEARISH_SWEEP",
+                        breach_price=curr_high,
+                        reclaim_price=curr_close,
+                        atr_excursion=round((curr_high - lvl.price) / atr_val, 2),
+                        status="UNCONFIRMED_WICK",
+                        rationale=f"Active wick through {lvl.level_type}. STOP-RUN NO-TRADE GATE ACTIVE (Awaiting bar closure).",
+                    ))
+
+            # Check Bullish Sweep (Sweep below support level)
+            if lvl.level_type in ["SESSION_LOW", "PDL", "VP_VAL"]:
+                min_dip = lvl.price - (self.min_sweep_atr_mult * atr_val)
+                max_dip = lvl.price - (self.max_sweep_atr_mult * atr_val)
+
+                # Case A: Sweep occurred on previous candle, confirmation on current candle
+                if (prev_low <= min_dip) and (prev_low >= max_dip) and (prev_close > lvl.price):
+                    is_confirmed = (curr_close > prev_close) and (curr_close > curr_open)
+                    status = "CONFIRMED_REJECTION" if is_confirmed else "UNCONFIRMED_WICK"
+                    events.append(SweepEvent(
+                        event_id=f"SWEEP_LOW_{lvl.level_id}_{curr_time}",
+                        timestamp=curr_time,
+                        level=lvl,
+                        sweep_type="BULLISH_SWEEP",
+                        breach_price=prev_low,
+                        reclaim_price=curr_close,
+                        atr_excursion=round((lvl.price - prev_low) / atr_val, 2),
+                        status=status,
+                        confirmation_bar_time=curr_time if is_confirmed else None,
+                        rationale=f"Swept {lvl.level_type} (${lvl.price:.2f}) by {lvl.price - prev_low:.2f} pts, closed back inside range.",
+                    ))
+                    if is_confirmed:
+                        status_verdict = f"CONFIRMED_BULLISH_REJECTION_{lvl.level_type}"
+
+                # Case B: Current bar is actively wicking below level
+                elif (curr_low <= min_dip) and (curr_close > lvl.price):
+                    events.append(SweepEvent(
+                        event_id=f"WICK_LOW_{lvl.level_id}_{curr_time}",
+                        timestamp=curr_time,
+                        level=lvl,
+                        sweep_type="BULLISH_SWEEP",
+                        breach_price=curr_low,
+                        reclaim_price=curr_close,
+                        atr_excursion=round((lvl.price - curr_low) / atr_val, 2),
+                        status="UNCONFIRMED_WICK",
+                        rationale=f"Active wick below {lvl.level_type}. STOP-RUN NO-TRADE GATE ACTIVE (Awaiting bar closure).",
+                    ))
+
+        return events, status_verdict

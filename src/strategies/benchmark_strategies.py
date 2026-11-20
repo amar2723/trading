@@ -14,6 +14,8 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from src.liquidity_map import LiquidityMap
+
 
 @dataclass
 class CandidateSignal:
@@ -34,6 +36,7 @@ class CandidateSignal:
 class H1TrendM5PullbackStrategy:
     """Strategy A: H1 Macro Trend + M5 Value-Zone Pullback."""
     name = "H1_TREND_M5_PULLBACK"
+    _lmap = LiquidityMap()
 
     @classmethod
     def evaluate(cls, df_m5: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> CandidateSignal:
@@ -42,6 +45,20 @@ class H1TrendM5PullbackStrategy:
         low = df_m5["low"].values
         current_price = float(close[-1])
         bar_time = str(df_m5["timestamp"].iloc[-1])
+
+        # Liquidity & Circuit Breaker Pre-Flight Check
+        events, status_note = cls._lmap.evaluate_sweeps_and_structure(df_m5)
+        if "CIRCUIT_BREAKER" in status_note or "FORCED_LIQUIDATION" in status_note:
+            return CandidateSignal(
+                strategy_name=cls.name, action="HOLD", entry=current_price, sl=current_price,
+                tp1=current_price, tp2=current_price, be_trigger=current_price,
+                risk_reward="1:1", risk_pips=0.0, confidence=0.0,
+                rationale=f"VETO: Circuit breaker engaged ({status_note}). Standing down to preserve capital.",
+                bar_time=bar_time,
+            )
+
+        active_wicks = [e for e in events if e.status == "UNCONFIRMED_WICK"]
+        confirmed_rejections = [e for e in events if e.status == "CONFIRMED_REJECTION"]
 
         # Causal H1 Trend
         h1_trend_bull = False
@@ -76,11 +93,19 @@ class H1TrendM5PullbackStrategy:
         # 2. Price is in the M5 Value Zone between EMA 20 and EMA 50
         # 3. RSI is in healthy reload zone (40 <= RSI <= 60), NOT exhausted
         # 4. Current bar closes bullish (close >= open)
+        # 5. Liquidity Gate: No active unconfirmed resistance wick or confirmed bearish rejection
+        has_bearish_rejection = any(e.sweep_type == "BEARISH_SWEEP" and e.status == "CONFIRMED_REJECTION" for e in confirmed_rejections)
+        has_bullish_rejection = any(e.sweep_type == "BULLISH_SWEEP" and e.status == "CONFIRMED_REJECTION" for e in confirmed_rejections)
+        has_bearish_wick = any(e.sweep_type == "BEARISH_SWEEP" and e.status == "UNCONFIRMED_WICK" for e in active_wicks)
+        has_bullish_wick = any(e.sweep_type == "BULLISH_SWEEP" and e.status == "UNCONFIRMED_WICK" for e in active_wicks)
+
         is_bull_pullback = (
             h1_trend_bull
             and (min(m5_e20, m5_e50) - 1.5 <= current_price <= max(m5_e20, m5_e50) + 1.0)
             and (38.0 <= rsi <= 62.0)
             and (close[-1] >= df_m5["open"].iloc[-1])
+            and not has_bearish_rejection
+            and not has_bearish_wick
         )
 
         if is_bull_pullback:
@@ -109,11 +134,14 @@ class H1TrendM5PullbackStrategy:
         # 2. Price is in the M5 Value Zone between EMA 20 and EMA 50
         # 3. RSI is in healthy reload zone (40 <= RSI <= 62), NOT oversold (< 35)
         # 4. Current bar closes bearish (close <= open)
+        # 5. Liquidity Gate: No active unconfirmed support wick or confirmed bullish bounce
         is_bear_pullback = (
             h1_trend_bear
             and (min(m5_e20, m5_e50) - 1.0 <= current_price <= max(m5_e20, m5_e50) + 1.5)
             and (38.0 <= rsi <= 62.0)
             and (close[-1] <= df_m5["open"].iloc[-1])
+            and not has_bullish_rejection
+            and not has_bullish_wick
         )
 
         if is_bear_pullback:
@@ -146,8 +174,9 @@ class H1TrendM5PullbackStrategy:
 
 
 class DonchianBreakoutStrategy:
-    """Strategy B: 20-period Donchian Breakout with H1 Trend & ATR filter."""
+    """Strategy B: 20-period Donchian Breakout with H1 Trend, ATR, & Liquidity filter."""
     name = "DONCHIAN_BREAKOUT"
+    _lmap = LiquidityMap()
 
     @classmethod
     def evaluate(cls, df_m5: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> CandidateSignal:
@@ -156,6 +185,24 @@ class DonchianBreakoutStrategy:
         low = df_m5["low"].values
         current_price = float(close[-1])
         bar_time = str(df_m5["timestamp"].iloc[-1])
+
+        # Liquidity & Circuit Breaker Pre-Flight Check
+        events, status_note = cls._lmap.evaluate_sweeps_and_structure(df_m5)
+        if "CIRCUIT_BREAKER" in status_note or "FORCED_LIQUIDATION" in status_note:
+            return CandidateSignal(
+                strategy_name=cls.name, action="HOLD", entry=current_price, sl=current_price,
+                tp1=current_price, tp2=current_price, be_trigger=current_price,
+                risk_reward="1:1", risk_pips=0.0, confidence=0.0,
+                rationale=f"VETO: Circuit breaker engaged ({status_note}). Standing down to preserve capital.",
+                bar_time=bar_time,
+            )
+
+        active_wicks = [e for e in events if e.status == "UNCONFIRMED_WICK"]
+        confirmed_rejections = [e for e in events if e.status == "CONFIRMED_REJECTION"]
+        has_bearish_rejection = any(e.sweep_type == "BEARISH_SWEEP" and e.status == "CONFIRMED_REJECTION" for e in confirmed_rejections)
+        has_bullish_rejection = any(e.sweep_type == "BULLISH_SWEEP" and e.status == "CONFIRMED_REJECTION" for e in confirmed_rejections)
+        has_bearish_wick = any(e.sweep_type == "BEARISH_SWEEP" and e.status == "UNCONFIRMED_WICK" for e in active_wicks)
+        has_bullish_wick = any(e.sweep_type == "BULLISH_SWEEP" and e.status == "UNCONFIRMED_WICK" for e in active_wicks)
 
         # Causal H1 Trend
         h1_trend_bull = False
@@ -183,8 +230,8 @@ class DonchianBreakoutStrategy:
         atr = float(pd.Series(tr).rolling(14).mean().iloc[-1])
         risk_dist = round(max(atr * 1.8, 6.50), 2)
 
-        # Only take Bullish Breakout if H1 is Bullish AND RSI is in momentum range (not overbought > 62)
-        if current_price > donch_high and h1_trend_bull and (45.0 <= rsi <= 62.0):
+        # Only take Bullish Breakout if H1 is Bullish AND RSI is in momentum range (not overbought > 62) AND no resistance rejection
+        if current_price > donch_high and h1_trend_bull and (45.0 <= rsi <= 62.0) and not has_bearish_rejection and not has_bearish_wick:
             entry = round(current_price, 2)
             sl = round(entry - risk_dist, 2)
             tp1 = round(entry + (risk_dist * 1.5), 2)
@@ -196,8 +243,8 @@ class DonchianBreakoutStrategy:
                 confidence=78.0, rationale=f"H1 Bull Breakout above 20-bar Donchian High (${donch_high:.2f}) with RSI {rsi:.1f}.",
                 bar_time=bar_time
             )
-        # Only take Bearish Breakout if H1 is Bearish AND RSI is in momentum range (not oversold < 38)
-        elif current_price < donch_low and h1_trend_bear and (38.0 <= rsi <= 55.0):
+        # Only take Bearish Breakout if H1 is Bearish AND RSI is in momentum range (not oversold < 38) AND no support rejection
+        elif current_price < donch_low and h1_trend_bear and (38.0 <= rsi <= 55.0) and not has_bullish_rejection and not has_bullish_wick:
             entry = round(current_price, 2)
             sl = round(entry + risk_dist, 2)
             tp1 = round(entry - (risk_dist * 1.5), 2)
@@ -221,6 +268,7 @@ class DonchianBreakoutStrategy:
 class VolatilitySqueezeStrategy:
     """Strategy C: Bollinger Band contraction inside Keltner Channels."""
     name = "VOLATILITY_SQUEEZE"
+    _lmap = LiquidityMap()
 
     @classmethod
     def evaluate(cls, df_m5: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> CandidateSignal:
@@ -229,6 +277,24 @@ class VolatilitySqueezeStrategy:
         low = df_m5["low"].values
         current_price = float(close[-1])
         bar_time = str(df_m5["timestamp"].iloc[-1])
+
+        # Liquidity & Circuit Breaker Pre-Flight Check
+        events, status_note = cls._lmap.evaluate_sweeps_and_structure(df_m5)
+        if "CIRCUIT_BREAKER" in status_note or "FORCED_LIQUIDATION" in status_note:
+            return CandidateSignal(
+                strategy_name=cls.name, action="HOLD", entry=current_price, sl=current_price,
+                tp1=current_price, tp2=current_price, be_trigger=current_price,
+                risk_reward="1:1", risk_pips=0.0, confidence=0.0,
+                rationale=f"VETO: Circuit breaker engaged ({status_note}). Standing down to preserve capital.",
+                bar_time=bar_time,
+            )
+
+        active_wicks = [e for e in events if e.status == "UNCONFIRMED_WICK"]
+        confirmed_rejections = [e for e in events if e.status == "CONFIRMED_REJECTION"]
+        has_bearish_rejection = any(e.sweep_type == "BEARISH_SWEEP" and e.status == "CONFIRMED_REJECTION" for e in confirmed_rejections)
+        has_bullish_rejection = any(e.sweep_type == "BULLISH_SWEEP" and e.status == "CONFIRMED_REJECTION" for e in confirmed_rejections)
+        has_bearish_wick = any(e.sweep_type == "BEARISH_SWEEP" and e.status == "UNCONFIRMED_WICK" for e in active_wicks)
+        has_bullish_wick = any(e.sweep_type == "BULLISH_SWEEP" and e.status == "UNCONFIRMED_WICK" for e in active_wicks)
 
         # Causal H1 Trend
         h1_trend_bull = False
@@ -264,9 +330,9 @@ class VolatilitySqueezeStrategy:
         risk_dist = round(max(atr * 1.8, 6.50), 2)
         momentum = current_price - float(sma20.iloc[-1])
 
-        # Expansion fire WITH H1 Trend Alignment & RSI reload zone (NOT exhausted)
-        is_firing_long = bb_upper > kc_upper and momentum > 0 and h1_trend_bull and (45.0 <= rsi <= 62.0)
-        is_firing_short = bb_lower < kc_lower and momentum < 0 and h1_trend_bear and (38.0 <= rsi <= 55.0)
+        # Expansion fire WITH H1 Trend Alignment, RSI reload zone, and Liquidity Clearance
+        is_firing_long = bb_upper > kc_upper and momentum > 0 and h1_trend_bull and (45.0 <= rsi <= 62.0) and not has_bearish_rejection and not has_bearish_wick
+        is_firing_short = bb_lower < kc_lower and momentum < 0 and h1_trend_bear and (38.0 <= rsi <= 55.0) and not has_bullish_rejection and not has_bullish_wick
 
         if is_firing_long:
             entry = round(current_price, 2)
