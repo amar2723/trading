@@ -442,13 +442,13 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
     next_win = sched.get("next_window", "Next Session")
 
     bsl_str = (
-        f"${nearest_bsl['price']:.2f} ({nearest_bsl['level_type']}) — `{nearest_bsl['distance_pips']}p away`\n"
+        f"${nearest_bsl['price']:.2f} (`{nearest_bsl['level_type']}`) — `{nearest_bsl['distance_pips']}p away`\n"
         f"  ↳ 🎯 *Trigger Zone*: `${nearest_bsl['sweep_min_trigger']:.2f} – ${nearest_bsl['sweep_max_trigger']:.2f}`\n"
         f"  ↳ ⏳ *Estimated Timing*: `{nearest_bsl.get('eta_display', 'N/A')}`"
     ) if nearest_bsl else "None"
 
     ssl_str = (
-        f"${nearest_ssl['price']:.2f} ({nearest_ssl['level_type']}) — `{nearest_ssl['distance_pips']}p away`\n"
+        f"${nearest_ssl['price']:.2f} (`{nearest_ssl['level_type']}`) — `{nearest_ssl['distance_pips']}p away`\n"
         f"  ↳ 🎯 *Trigger Zone*: `${nearest_ssl['sweep_min_trigger']:.2f} – ${nearest_ssl['sweep_max_trigger']:.2f}`\n"
         f"  ↳ ⏳ *Estimated Timing*: `{nearest_ssl.get('eta_display', 'N/A')}`"
     ) if nearest_ssl else "None"
@@ -467,21 +467,72 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
     )
 
     if setup["action"] == "HOLD":
+        # Derive high-probability pre-sweep prediction from nearest liquidity targets
+        pred_section = ""
+        curr_p = float(setup.get("price", 0.0))
+        atr_est = float(wl.get("atr_5m", 3.50)) if wl.get("atr_5m") else 3.50
+
+        target_pool = None
+        target_dir = ""
+        if nearest_bsl and nearest_ssl:
+            if nearest_ssl["distance_usd"] < nearest_bsl["distance_usd"]:
+                target_pool = nearest_ssl
+                target_dir = "LONG_REVERSAL"
+            else:
+                target_pool = nearest_bsl
+                target_dir = "SHORT_REVERSAL"
+        elif nearest_ssl:
+            target_pool = nearest_ssl
+            target_dir = "LONG_REVERSAL"
+        elif nearest_bsl:
+            target_pool = nearest_bsl
+            target_dir = "SHORT_REVERSAL"
+
+        if target_pool:
+            if target_dir == "LONG_REVERSAL":
+                pred_icon = "🟢"
+                pred_action = "BUY (Long Reversal on SSL Sweep)"
+                pred_entry = target_pool["price"]
+                pred_sl = round(target_pool["price"] - max(2.5, atr_est * 1.2), 2)
+                pred_tp1 = round(vwap_val if (vwap_val and vwap_val > pred_entry) else (pred_entry + 1.5 * abs(pred_entry - pred_sl)), 2)
+                pred_tp2 = round(nearest_bsl["price"] if nearest_bsl else (pred_entry + 3.0 * abs(pred_entry - pred_sl)), 2)
+                pred_trigger = f"${target_pool.get('sweep_max_trigger', pred_entry - 2.0):.2f} – ${target_pool.get('sweep_min_trigger', pred_entry):.2f}"
+            else:
+                pred_icon = "🔴"
+                pred_action = "SELL (Short Reversal on BSL Sweep)"
+                pred_entry = target_pool["price"]
+                pred_sl = round(target_pool["price"] + max(2.5, atr_est * 1.2), 2)
+                pred_tp1 = round(vwap_val if (vwap_val and vwap_val < pred_entry) else (pred_entry - 1.5 * abs(pred_sl - pred_entry)), 2)
+                pred_tp2 = round(nearest_ssl["price"] if nearest_ssl else (pred_entry - 3.0 * abs(pred_sl - pred_entry)), 2)
+                pred_trigger = f"${target_pool.get('sweep_min_trigger', pred_entry):.2f} – ${target_pool.get('sweep_max_trigger', pred_entry + 2.0):.2f}"
+
+            pred_eta = target_pool.get("eta_display", "APPROACHING")
+            pred_section = (
+                f"🔮 *PREDICTED NEXT TRADE SETUP (EXCLUSIVE SWEEP)*:\n"
+                f"• 🎯 *Target Pool*: `{target_pool['level_id']}` (`{target_pool['level_type']}`) at `${target_pool['price']:.2f}`\n"
+                f"• ⚡ *Predicted Signal*: {pred_icon} *{pred_action}*\n"
+                f"• 📍 *Predicted Entry Zone*: `{pred_trigger}`\n"
+                f"• 🛑 *Predicted Stop Loss (SL)*: `${pred_sl:.2f}` (Beyond sweep wick)\n"
+                f"• 🏁 *Predicted Take Profit 1 (TP1)*: `${pred_tp1:.2f}` (Session VWAP Fair Value)\n"
+                f"• 🚀 *Predicted Take Profit 2 (TP2)*: `${pred_tp2:.2f}` (Opposite Liquidity Pool)\n"
+                f"• ⏳ *Estimated Sweep Arrival*: `{pred_eta}`\n"
+                f"• 🛡️ *Order Readiness*: `ARMED — Ready to fire on confirmed sweep rejection`\n\n"
+            )
+
         return (
-            f"⏸️ *AWAITING LIQUIDITY SWEEP (HOLD)*\n"
+            f"🔮 *PREDICTED INSTITUTIONAL SETUP (AWAITING SWEEP TRIGGER)*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *Asset*: XAUUSD (Gold - M5 Live)\n"
             f"💵 *Live Market Price*: `${setup['price']:.2f}`\n"
             f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n\n"
+            f"{pred_section}"
             f"{wl_section}\n"
             f"🛡️ *Capital Preservation Mode Active*\n"
-            f"• Generic chop/pullback trades are strictly MUTED.\n"
-            f"• Risk Governor status: Standing down (0 active exposure).\n"
-            f"• ML Meta-Filter: ABSTAIN (Waiting for confirmed BSL/SSL sweep).\n"
-            f"• Indicators: RSI at `{setup.get('rsi', 50.0)}` | Volume: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n\n"
-            f"{setup['why']}\n"
+            f"• Generic chop/pullback trades are strictly MUTED (Sweep-Only mode).\n"
+            f"• Risk Governor status: Armed (Zero active exposure until trigger).\n"
+            f"• Indicators: RSI at `{setup.get('rsi', 50.0)}` | Volume: 🟢 {setup.get('buyer_pct', 50.0):.1f}% vs 🔴 {setup.get('seller_pct', 50.0):.1f}%\n\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 *Commands*: `/trade` | `/demo` | `/status` | `/audit`"
+            f"💡 *Commands*: `/trade` | `/signal` | `/status` | `/help`"
         )
 
     icon = "🔴" if setup["action"] == "SELL" else "🟢"
@@ -563,6 +614,15 @@ def robust_send_telegram(token: str, chat_id: str | int, text: str) -> bool:
             )
             if r.status_code == 200:
                 return True
+            elif r.status_code == 400:
+                # Failsafe: Telegram entity parsing failure, fallback to plain text to prevent dropped messages
+                r_plain = requests.post(
+                    url,
+                    json={"chat_id": chat_id, "text": text},
+                    timeout=10,
+                )
+                if r_plain.status_code == 200:
+                    return True
         except Exception as e:
             logger.warning("Telegram attempt %d failed: %s", attempt + 1, e)
             time.sleep(1)

@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import urllib.request
+import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import numpy as np
@@ -126,42 +127,74 @@ def validate_candle_dataframe(
     return True, "OK"
 
 
+_WEB_SESSION: requests.Session | None = None
+
+
+def get_web_session() -> requests.Session:
+    global _WEB_SESSION
+    if _WEB_SESSION is None:
+        _WEB_SESSION = requests.Session()
+        _WEB_SESSION.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        })
+    return _WEB_SESSION
+
+
 def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: int = 100) -> pd.DataFrame:
     """
-    Fetches gold candles from Yahoo Finance COMEX Futures (GC=F).
+    Fetches gold candles from Yahoo Finance COMEX Futures (GC=F) with sub-second pooling.
     EXPLICITLY labeled as YAHOO_GC_F_FUTURES_PROXY.
+    Guarantees candle freshness: only truly forming bars are dropped; already-closed bars are preserved.
     """
     interval_map = {"M1": "1m", "M5": "5m", "M15": "15m", "H1": "1h"}
     interval = interval_map.get(timeframe.upper(), "5m")
     range_param = "5d" if interval in ["5m", "15m", "1h"] else "1d"
     
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={range_param}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        data = json.loads(resp.read().decode())
-        res = data["chart"]["result"][0]
-        timestamps = res["timestamp"]
-        quotes = res["indicators"]["quote"][0]
-        df = pd.DataFrame({
-            "timestamp": pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
-            "open": quotes["open"],
-            "high": quotes["high"],
-            "low": quotes["low"],
-            "close": quotes["close"],
-            "volume": quotes.get("volume", [100.0] * len(timestamps)),
-        }).dropna()
-        df = df.rename(columns={"volume": "tick_volume"})
-        df["volume"] = df["tick_volume"]
+    session = get_web_session()
+    resp = session.get(url, timeout=5)
+    resp.raise_for_status()
+    data = resp.json()
+    res = data["chart"]["result"][0]
+    meta = res.get("meta", {})
+    timestamps = res["timestamp"]
+    quotes = res["indicators"]["quote"][0]
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
+        "open": quotes["open"],
+        "high": quotes["high"],
+        "low": quotes["low"],
+        "close": quotes["close"],
+        "volume": quotes.get("volume", [100.0] * len(timestamps)),
+    }).dropna()
+    df = df.rename(columns={"volume": "tick_volume"})
+    df["volume"] = df["tick_volume"]
 
-        # Drop the forming in-progress bar so we only analyze fully closed bars
-        # If timestamp of latest bar is within the current timeframe interval
-        if len(df) > 1:
+    # Candle Freshness Gate:
+    # Drop any forming in-progress bars whose close time is strictly in the future.
+    # A bar has closed if now_utc >= candle_timestamp + tf_delta.
+    now_utc = datetime.now(timezone.utc)
+    tf_minutes = TIMEFRAME_MINUTES.get(timeframe.upper(), 5)
+    tf_delta = timedelta(minutes=tf_minutes)
+    while len(df) > 1:
+        last_candle_ts = df["timestamp"].iloc[-1].to_pydatetime()
+        if last_candle_ts.tzinfo is None:
+            last_candle_ts = last_candle_ts.replace(tzinfo=timezone.utc)
+        candle_close_time = last_candle_ts + tf_delta
+        if now_utc < candle_close_time:
             df = df.iloc[:-1].reset_index(drop=True)
+        else:
+            break
 
-        df["data_source"] = "YAHOO_GC_F_FUTURES_PROXY"
-        df["is_broker_spot"] = False
-        df["is_futures_proxy"] = True
-        return df.tail(bars).reset_index(drop=True)
+    df["data_source"] = "YAHOO_GC_F_FUTURES_PROXY"
+    df["is_broker_spot"] = False
+    df["is_futures_proxy"] = True
+    if meta.get("regularMarketPrice") is not None:
+        df.attrs["regular_market_price"] = float(meta["regularMarketPrice"])
+        df.attrs["regular_market_time"] = meta.get("regularMarketTime")
+
+    return df.tail(bars).reset_index(drop=True)
 
 
 def is_terminal_process_active() -> bool:
@@ -265,9 +298,10 @@ def fetch_live_tick(symbol: str = "XAUUSD") -> SpreadQuote:
             logger.warning("Live tick MT5 error: %s", e)
 
     # Synthetic fallback (explicitly marked is_broker_confirmed=False)
-    candles = fetch_live_candles(symbol, "M5", 2)
+    candles = fetch_live_candles(symbol, "M5", 25)
     if not candles.empty:
-        last = float(candles.iloc[-1]["close"])
+        reg_price = candles.attrs.get("regular_market_price")
+        last = float(reg_price) if reg_price is not None else float(candles.iloc[-1]["close"])
         return SpreadQuote.from_bid_ask(
             bid=round(last - 0.21, 2),
             ask=round(last + 0.21, 2),

@@ -116,9 +116,13 @@ def compute_indicator_dataframe(
         h1["h1_ema50"] = h1["h1_close"].ewm(span=50).mean()
         h1["h1_trend_bias"] = np.where(h1["h1_close"] > h1["h1_ema50"], 1, -1)
 
+        # Drop prior H1 columns if present to avoid _x / _y collisions during merge_asof
+        cols_to_drop = [c for c in ["h1_trend_bias", "h1_dist_ema50", "h1_close", "h1_completed_at", "h1_ema20", "h1_ema50"] if c in df.columns]
+        df_clean = df.drop(columns=cols_to_drop) if cols_to_drop else df
+
         # Causal as-of merge (guarantees zero future leakage from incomplete H1 bars)
         merged = pd.merge_asof(
-            df,
+            df_clean,
             h1[["h1_completed_at", "h1_close", "h1_ema20", "h1_ema50", "h1_trend_bias"]],
             left_on="timestamp",
             right_on="h1_completed_at",

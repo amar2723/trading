@@ -104,11 +104,21 @@ def run_telegram_vip_bot():
 
 
 def send_msg(base_url: str, chat_id: int, text: str):
-    requests.post(
-        f"{base_url}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-        timeout=10,
-    )
+    try:
+        r = requests.post(
+            f"{base_url}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+        if r.status_code == 400:
+            # Fallback to plain text if Markdown parsing fails
+            requests.post(
+                f"{base_url}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=10,
+            )
+    except Exception as e:
+        logger.error("send_msg error: %s", e)
 
 
 if __name__ == "__main__":
