@@ -170,3 +170,55 @@ def test_forced_liquidation_circuit_breaker():
     tripped_cooldown, msg_cooldown = monitor.evaluate(df)
     assert tripped_cooldown
     assert "CIRCUIT_BREAKER_COOLING" in msg_cooldown
+
+
+def test_pre_sweep_liquidity_watchlist():
+    """Validates pre-sweep watchlist mapping BSL/SSL pools before price reaches them."""
+    df = _generate_synthetic_multiday_candles()
+    lmap = LiquidityMap()
+    wl = lmap.get_pre_sweep_liquidity_watchlist(df)
+
+    assert "current_price" in wl
+    assert "nearest_bsl" in wl
+    assert "nearest_ssl" in wl
+    assert "fair_value_targets" in wl
+
+    if wl["nearest_bsl"]:
+        assert wl["nearest_bsl"]["price"] > wl["current_price"]
+        assert wl["nearest_bsl"]["distance_pips"] >= 0.0
+
+    if wl["nearest_ssl"]:
+        assert wl["nearest_ssl"]["price"] < wl["current_price"]
+        assert wl["nearest_ssl"]["distance_pips"] >= 0.0
+
+
+def test_liquidity_sweep_reversal_strategy():
+    """Validates that LiquiditySweepReversalStrategy emits trades ONLY on confirmed sweeps."""
+    from src.strategies.benchmark_strategies import LiquiditySweepReversalStrategy
+
+    df = _generate_synthetic_multiday_candles()
+    # Baseline: No sweep -> must emit HOLD
+    sig_base = LiquiditySweepReversalStrategy.evaluate(df)
+    assert sig_base.action == "HOLD"
+    assert "AWAITING_SWEEP" in sig_base.rationale
+
+    # Construct confirmed bearish sweep
+    levels = LiquidityMap().compute_session_levels(df)
+    asia_high = next(lvl for lvl in levels if lvl.level_id.startswith("ASIA_HIGH"))
+    last_idx = len(df) - 1
+
+    df.loc[last_idx - 1, "high"] = asia_high.price + 3.0
+    df.loc[last_idx - 1, "close"] = asia_high.price - 1.0
+    df.loc[last_idx - 1, "open"] = asia_high.price - 2.0
+
+    df.loc[last_idx, "open"] = asia_high.price - 1.0
+    df.loc[last_idx, "close"] = asia_high.price - 3.5
+    df.loc[last_idx, "high"] = asia_high.price - 0.5
+    df.loc[last_idx, "low"] = asia_high.price - 4.0
+
+    sig_sweep = LiquiditySweepReversalStrategy.evaluate(df)
+    assert sig_sweep.action == "SELL"
+    assert sig_sweep.sl > sig_sweep.entry
+    assert sig_sweep.tp1 < sig_sweep.entry
+    assert "POST-SWEEP SHORT" in sig_sweep.rationale
+

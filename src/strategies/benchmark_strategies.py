@@ -365,3 +365,109 @@ class VolatilitySqueezeStrategy:
             risk_reward="1:1", risk_pips=0.0, confidence=50.0,
             rationale="Volatility within normal compression band or exhausted.", bar_time=bar_time
         )
+
+
+class LiquiditySweepReversalStrategy:
+    """
+    Premier Institutional Liquidity Strategy: Post-Sweep Judas Reversal (Turtle Soup).
+    Triggers ONLY when resting liquidity (BSL or SSL) is swept and confirmed rejected.
+    Filters out 100% of trend-pullback and consolidation chop trades.
+    """
+    name = "LIQUIDITY_SWEEP_REVERSAL"
+    _lmap = LiquidityMap()
+
+    @classmethod
+    def evaluate(cls, df_m5: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> CandidateSignal:
+        close = df_m5["close"].values
+        current_price = float(close[-1])
+        bar_time = str(df_m5["timestamp"].iloc[-1])
+
+        # 1. Pre-flight Circuit Breaker & Sweep Detection
+        events, status_note = cls._lmap.evaluate_sweeps_and_structure(df_m5)
+        if "CIRCUIT_BREAKER" in status_note or "FORCED_LIQUIDATION" in status_note:
+            return CandidateSignal(
+                strategy_name=cls.name, action="HOLD", entry=current_price, sl=current_price,
+                tp1=current_price, tp2=current_price, be_trigger=current_price,
+                risk_reward="1:1", risk_pips=0.0, confidence=0.0,
+                rationale=f"VETO: Circuit breaker engaged ({status_note}). Capital strictly preserved.",
+                bar_time=bar_time,
+            )
+
+        watchlist = cls._lmap.get_pre_sweep_liquidity_watchlist(df_m5)
+        nearest_bsl = watchlist.get("nearest_bsl")
+        nearest_ssl = watchlist.get("nearest_ssl")
+        bsl_info = f"${nearest_bsl['price']:.2f} ({nearest_bsl['distance_pips']}p away)" if nearest_bsl else "None"
+        ssl_info = f"${nearest_ssl['price']:.2f} ({nearest_ssl['distance_pips']}p away)" if nearest_ssl else "None"
+
+        confirmed_rejections = [e for e in events if e.status == "CONFIRMED_REJECTION"]
+        if not confirmed_rejections:
+            return CandidateSignal(
+                strategy_name=cls.name, action="HOLD", entry=current_price, sl=current_price,
+                tp1=current_price, tp2=current_price, be_trigger=current_price,
+                risk_reward="1:1", risk_pips=0.0, confidence=50.0,
+                rationale=f"AWAITING_SWEEP: No verified liquidity sweep completed. Nearest BSL: {bsl_info} | Nearest SSL: {ssl_info}.",
+                bar_time=bar_time,
+            )
+
+        # Look for the strongest confirmed sweep event
+        latest_rejection = confirmed_rejections[-1]
+        fair_value = watchlist.get("fair_value_targets", {})
+        session_vwap = fair_value.get("session_vwap") or current_price
+
+        # Case A: Bearish Sweep (Buy-Side Liquidity Swept and Rejected -> Enter SHORT)
+        if latest_rejection.sweep_type == "BEARISH_SWEEP":
+            entry = round(current_price, 2)
+            sweep_high = latest_rejection.breach_price
+            raw_risk = max(sweep_high - entry + 0.50, 4.00)
+            risk_dist = round(min(raw_risk, 10.00), 2)
+            sl = round(entry + risk_dist, 2)
+
+            tp1_target = session_vwap if (session_vwap < entry - (risk_dist * 1.2)) else (entry - (risk_dist * 1.5))
+            tp1 = round(tp1_target, 2)
+
+            tp2_target = nearest_ssl["price"] if (nearest_ssl and nearest_ssl["price"] < tp1) else (entry - (risk_dist * 2.8))
+            tp2 = round(tp2_target, 2)
+
+            be_trig = round(entry - max(risk_dist * 0.85, 3.50), 2)
+            risk_pips = round(risk_dist * 10.0, 1)
+
+            return CandidateSignal(
+                strategy_name=cls.name, action="SELL", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+                be_trigger=be_trig, risk_reward="1 : 2.0", risk_pips=risk_pips,
+                confidence=86.0,
+                rationale=f"POST-SWEEP SHORT: Swept {latest_rejection.level.level_type} (${latest_rejection.level.price:.2f}) wick ${sweep_high:.2f}. Confirmed bearish bar closure inside range.",
+                bar_time=bar_time,
+            )
+
+        # Case B: Bullish Sweep (Sell-Side Liquidity Swept and Rejected -> Enter LONG)
+        elif latest_rejection.sweep_type == "BULLISH_SWEEP":
+            entry = round(current_price, 2)
+            sweep_low = latest_rejection.breach_price
+            raw_risk = max(entry - sweep_low + 0.50, 4.00)
+            risk_dist = round(min(raw_risk, 10.00), 2)
+            sl = round(entry - risk_dist, 2)
+
+            tp1_target = session_vwap if (session_vwap > entry + (risk_dist * 1.2)) else (entry + (risk_dist * 1.5))
+            tp1 = round(tp1_target, 2)
+
+            tp2_target = nearest_bsl["price"] if (nearest_bsl and nearest_bsl["price"] > tp1) else (entry + (risk_dist * 2.8))
+            tp2 = round(tp2_target, 2)
+
+            be_trig = round(entry + max(risk_dist * 0.85, 3.50), 2)
+            risk_pips = round(risk_dist * 10.0, 1)
+
+            return CandidateSignal(
+                strategy_name=cls.name, action="BUY", entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+                be_trigger=be_trig, risk_reward="1 : 2.0", risk_pips=risk_pips,
+                confidence=86.0,
+                rationale=f"POST-SWEEP LONG: Swept {latest_rejection.level.level_type} (${latest_rejection.level.price:.2f}) wick ${sweep_low:.2f}. Confirmed bullish bar closure inside range.",
+                bar_time=bar_time,
+            )
+
+        return CandidateSignal(
+            strategy_name=cls.name, action="HOLD", entry=current_price, sl=current_price,
+            tp1=current_price, tp2=current_price, be_trigger=current_price,
+            risk_reward="1:1", risk_pips=0.0, confidence=50.0,
+            rationale="No actionable post-sweep structure detected.", bar_time=bar_time
+        )
+

@@ -36,8 +36,10 @@ from src.strategies.benchmark_strategies import (
     H1TrendM5PullbackStrategy,
     DonchianBreakoutStrategy,
     VolatilitySqueezeStrategy,
+    LiquiditySweepReversalStrategy,
     CandidateSignal,
 )
+from src.liquidity_map import LiquidityMap
 from src.ml_meta_filter import MLMetaFilter
 from src.risk_governor import RiskGovernor
 from src.signal_journal import SignalJournal
@@ -271,18 +273,30 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     session_name = "LONDON KILLZONE" if is_london else ("NEW YORK KILLZONE" if is_ny else ("ASIAN CHOP (Cautious)" if (0 <= curr_hour <= 6) else "INTER-SESSION"))
 
     # Phase 2 Strategy Layer Evaluation (Deterministic Entry Engines)
+    lmap = LiquidityMap()
+    watchlist = lmap.get_pre_sweep_liquidity_watchlist(df)
+    sig_sweep = LiquiditySweepReversalStrategy.evaluate(df_proc, df_h1)
     sig_pullback = H1TrendM5PullbackStrategy.evaluate(df_proc, df_h1)
     sig_donchian = DonchianBreakoutStrategy.evaluate(df_proc, df_h1)
     sig_squeeze = VolatilitySqueezeStrategy.evaluate(df_proc, df_h1)
 
-    # Strategy Priority: 1. Value Pullback (Highest Expectancy) -> 2. Breakout -> 3. Squeeze
+    # User Preference: SWEEP_ONLY_MODE (Set SWEEP_ONLY_MODE=1 to trade ONLY verified post-liquidity sweeps)
+    sweep_only_mode = os.environ.get("SWEEP_ONLY_MODE", "0") == "1"
+
+    # Strategy Priority: 1. Liquidity Sweep Reversal (Highest Alpha) -> 2. Pullback -> 3. Breakout -> 4. Squeeze
     chosen_sig = None
-    if sig_pullback.action != "HOLD":
-        chosen_sig = sig_pullback
-    elif sig_donchian.action != "HOLD":
-        chosen_sig = sig_donchian
-    elif sig_squeeze.action != "HOLD":
-        chosen_sig = sig_squeeze
+    if sig_sweep.action != "HOLD":
+        chosen_sig = sig_sweep
+    elif not sweep_only_mode:
+        if sig_pullback.action != "HOLD":
+            chosen_sig = sig_pullback
+        elif sig_donchian.action != "HOLD":
+            chosen_sig = sig_donchian
+        elif sig_squeeze.action != "HOLD":
+            chosen_sig = sig_squeeze
+    else:
+        # Sweep-only filter active: Stand down until resting liquidity is swept
+        chosen_sig = sig_sweep
 
     # Strict Broker Spot Provenance Verification
     # Untagged or non-broker feeds strictly default to is_broker_spot=False
@@ -411,21 +425,41 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         "rsi": round(rsi_val, 1),
         "why": why,
         "time": str(last_ts),
+        "watchlist": watchlist,
     }
 
 
 def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str:
+    wl = setup.get("watchlist", {})
+    nearest_bsl = wl.get("nearest_bsl")
+    nearest_ssl = wl.get("nearest_ssl")
+    fv = wl.get("fair_value_targets", {})
+    vwap_val = fv.get("session_vwap")
+
+    bsl_str = f"${nearest_bsl['price']:.2f} ({nearest_bsl['level_type']}) — {nearest_bsl['distance_pips']}p away" if nearest_bsl else "None"
+    ssl_str = f"${nearest_ssl['price']:.2f} ({nearest_ssl['level_type']}) — {nearest_ssl['distance_pips']}p away" if nearest_ssl else "None"
+    vwap_str = f"${vwap_val:.2f}" if (vwap_val and vwap_val > 0) else "N/A"
+
+    wl_section = (
+        f"🎯 *PRE-SWEEP LIQUIDITY MAP (RESTING POOLS)*:\n"
+        f"• 🔴 *Buy-Side (BSL / Highs)*: `{bsl_str}`\n"
+        f"• 🟢 *Sell-Side (SSL / Lows)*: `{ssl_str}`\n"
+        f"• ⚖️ *Fair Value (VWAP)*: `{vwap_str}`\n"
+        f"• 🛡️ *Filter Mode*: `EXCLUSIVE LIQUIDITY SWEEPS ONLY`\n"
+    )
+
     if setup["action"] == "HOLD":
         return (
-            f"⏸️ *MARKET CONSOLIDATION (HOLD)*\n"
+            f"⏸️ *AWAITING LIQUIDITY SWEEP (HOLD)*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 *Asset*: XAUUSD (Gold - M5 Live)\n"
             f"💵 *Live Market Price*: `${setup['price']:.2f}`\n"
             f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n\n"
+            f"{wl_section}\n"
             f"🛡️ *Capital Preservation Mode Active*\n"
-            f"• No high-probability pullback or breakout confirmed.\n"
+            f"• Generic chop/pullback trades are strictly MUTED.\n"
             f"• Risk Governor status: Standing down (0 active exposure).\n"
-            f"• ML Meta-Filter: ABSTAIN (Waiting for high-expectancy setup).\n"
+            f"• ML Meta-Filter: ABSTAIN (Waiting for confirmed BSL/SSL sweep).\n"
             f"• Indicators: RSI at `{setup.get('rsi', 50.0)}` | Volume: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n\n"
             f"{setup['why']}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"

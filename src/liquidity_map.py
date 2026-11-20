@@ -472,3 +472,88 @@ class LiquidityMap:
                     ))
 
         return events, status_verdict
+
+    def get_pre_sweep_liquidity_watchlist(self, df: pd.DataFrame) -> dict:
+        """
+        Maps all active institutional liquidity pools BEFORE they are swept.
+        Returns:
+        - current_price
+        - buy_side_liquidity (BSL): Resting buy-stops above current market price.
+        - sell_side_liquidity (SSL): Resting sell-stops below current market price.
+        - fair_value_targets: Session VWAP, POC, VAH, VAL.
+        - nearest_bsl: The closest overhead pool to be swept for a potential SHORT setup.
+        - nearest_ssl: The closest underlying pool to be swept for a potential LONG setup.
+        """
+        if df is None or len(df) < 5:
+            return {}
+
+        current_price = float(df["close"].iloc[-1])
+        levels = self.compute_session_levels(df)
+        vwap_dict = self.compute_anchored_vwap(df)
+        vp_dict = self.compute_volume_profile(df)
+
+        atr_series = self._compute_atr(df, 14)
+        atr_val = float(atr_series.iloc[-1]) if not atr_series.empty else 5.0
+        atr_val = max(atr_val, 1.0)
+
+        # Incorporate Volume Profile levels into reference pool
+        if "vp_vah" in vp_dict and vp_dict["vp_vah"] > 0:
+            levels.append(LiquidityReferenceLevel(
+                level_id="VP_VAH_24H", level_type="VP_VAH", session="PROFILE",
+                price=round(vp_dict["vp_vah"], 2), volume_weight=1500.0,
+                established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area High"
+            ))
+        if "vp_val" in vp_dict and vp_dict["vp_val"] > 0:
+            levels.append(LiquidityReferenceLevel(
+                level_id="VP_VAL_24H", level_type="VP_VAL", session="PROFILE",
+                price=round(vp_dict["vp_val"], 2), volume_weight=1500.0,
+                established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area Low"
+            ))
+
+        bsl_list = []
+        ssl_list = []
+
+        for lvl in levels:
+            dist_usd = round(abs(lvl.price - current_price), 2)
+            dist_pips = round(dist_usd * 10.0, 1)
+
+            pool_entry = {
+                "level_id": lvl.level_id,
+                "level_type": lvl.level_type,
+                "session": lvl.session,
+                "price": lvl.price,
+                "distance_usd": dist_usd,
+                "distance_pips": dist_pips,
+                "evidence": lvl.evidence,
+                "sweep_min_trigger": round(lvl.price + (self.min_sweep_atr_mult * atr_val) if lvl.price > current_price else lvl.price - (self.min_sweep_atr_mult * atr_val), 2),
+                "sweep_max_trigger": round(lvl.price + (self.max_sweep_atr_mult * atr_val) if lvl.price > current_price else lvl.price - (self.max_sweep_atr_mult * atr_val), 2),
+            }
+
+            if lvl.price > current_price:
+                bsl_list.append(pool_entry)
+            elif lvl.price < current_price:
+                ssl_list.append(pool_entry)
+
+        # Sort BSL closest first (lowest price above current)
+        bsl_list.sort(key=lambda x: x["price"])
+        # Sort SSL closest first (highest price below current)
+        ssl_list.sort(key=lambda x: x["price"], reverse=True)
+
+        nearest_bsl = bsl_list[0] if bsl_list else None
+        nearest_ssl = ssl_list[0] if ssl_list else None
+
+        return {
+            "current_price": current_price,
+            "atr_14": round(atr_val, 2),
+            "nearest_bsl": nearest_bsl,
+            "nearest_ssl": nearest_ssl,
+            "all_bsl_pools": bsl_list,
+            "all_ssl_pools": ssl_list,
+            "fair_value_targets": {
+                "session_vwap": vwap_dict.get("vwap"),
+                "poc": vp_dict.get("vp_poc"),
+                "vah": vp_dict.get("vp_vah"),
+                "val": vp_dict.get("vp_val"),
+            }
+        }
+
