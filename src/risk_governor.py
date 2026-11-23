@@ -14,7 +14,7 @@ Enforces:
 import logging
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Any
 
 logger = logging.getLogger("RiskGovernor")
 
@@ -31,6 +31,9 @@ class RiskApproval:
     risk_usd: float
     risk_pct: float
     veto_reason: str | None = None
+    k_vol: float = 1.0
+    conviction_factor: float = 1.0
+    effective_risk_pct: float = 1.0
 
 
 class RiskGovernor:
@@ -63,6 +66,9 @@ class RiskGovernor:
         min_volume: float = 0.01,          # Minimum broker volume
         volume_step: float = 0.01,         # Broker volume step
         round_trip_slippage_usd: float = 0.10,  # $0.05 entry + $0.05 exit slippage per oz
+        news_filter: Any | None = None,    # Optional NewsCalendarFilter instance
+        atr_benchmark: float = 3.50,       # Baseline ATR for volatility targeting
+        consecutive_loss_limit: int = 3,   # Cooldown trip limit
     ):
         self.max_risk_pct = max_risk_pct
         self.max_spread_pips = max_spread_pips
@@ -72,6 +78,25 @@ class RiskGovernor:
         self.min_volume = min_volume
         self.volume_step = volume_step
         self.round_trip_slippage_usd = round_trip_slippage_usd
+        self.news_filter = news_filter
+        self.atr_benchmark = atr_benchmark
+        self.consecutive_loss_limit = consecutive_loss_limit
+        self.consecutive_losses = 0
+
+    def record_trade_result(self, pnl_usd: float) -> None:
+        """Tracks consecutive losses for institutional cooldown governor."""
+        if pnl_usd < 0:
+            self.consecutive_losses += 1
+            logger.warning(
+                "RiskGovernor: Recorded loss. Consecutive losses now: %d", self.consecutive_losses
+            )
+        else:
+            if self.consecutive_losses > 0:
+                logger.info("RiskGovernor: Winning/breakeven trade. Consecutive losses reset to 0.")
+            self.consecutive_losses = 0
+
+    def reset_consecutive_losses(self) -> None:
+        self.consecutive_losses = 0
 
     def review_trade(
         self,
@@ -87,7 +112,34 @@ class RiskGovernor:
         is_reconciled: bool = True,
         session_hour: int | None = None,
         spread_included_in_prices: bool = False,
+        atr_current: float | None = None,
+        conviction_score: float | None = None,
+        news_status: Any | None = None,
+        consecutive_losses: int | None = None,
     ) -> RiskApproval:
+        # Check -2: Economic News Calendar Blackout Gate
+        if self.news_filter is not None:
+            n_status = self.news_filter.get_news_status()
+            if getattr(n_status, "is_locked", False):
+                return RiskApproval(
+                    approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
+                    veto_reason=f"VETO: RED-FOLDER NEWS BLACKOUT ({getattr(n_status, 'reason', 'Active news lockout')})"
+                )
+        elif news_status is not None and getattr(news_status, "is_locked", False):
+            reason = getattr(news_status, "reason", "High-impact economic event lockout")
+            return RiskApproval(
+                approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
+                veto_reason=f"VETO: RED-FOLDER NEWS BLACKOUT ({reason})"
+            )
+
+        # Check -1: Consecutive Loss Cooldown Gate
+        eff_losses = consecutive_losses if consecutive_losses is not None else self.consecutive_losses
+        if eff_losses >= self.consecutive_loss_limit:
+            return RiskApproval(
+                approved=False, lot_size=0.0, risk_usd=0.0, risk_pct=0.0,
+                veto_reason=f"VETO: Consecutive loss cooldown ({eff_losses} consecutive losses >= limit {self.consecutive_loss_limit}). Stand down active."
+            )
+
         # Check 0: Asian session chop shield (00:00 - 06:00 UTC)
         if session_hour is not None and 0 <= session_hour <= 6:
             return RiskApproval(
@@ -174,8 +226,27 @@ class RiskGovernor:
             except Exception:
                 pass
 
-        # Maximum allowable risk budget in USD (Strict 1.0% limit)
-        max_allowed_risk_usd = round(equity * (self.max_risk_pct / 100.0), 4)
+        # Volatility Targeting Scalar (k_vol)
+        if atr_current is not None and atr_current > 0:
+            k_vol = max(0.50, min(1.50, round(self.atr_benchmark / atr_current, 3)))
+        else:
+            k_vol = 1.0
+
+        # Conviction Factor
+        if conviction_score is not None:
+            if conviction_score < 0.55:
+                conviction_factor = 0.50
+            elif conviction_score < 0.65:
+                conviction_factor = 0.75
+            else:
+                conviction_factor = 1.00
+        else:
+            conviction_factor = 1.00
+
+        # Dynamic Risk Budget: Scales down when volatility expands or conviction is modest
+        # Hard cap at max_risk_pct prevents breaching the 1.0% safety boundary
+        effective_risk_pct = min(self.max_risk_pct, round(self.max_risk_pct * k_vol * conviction_factor, 3))
+        max_allowed_risk_usd = round(equity * (effective_risk_pct / 100.0), 4)
 
         # Raw lot size that strictly respects the risk budget
         raw_volume = max_allowed_risk_usd / loss_per_lot_usd
@@ -198,8 +269,11 @@ class RiskGovernor:
                 veto_reason=(
                     f"VETO: Account undercapitalized for minimum broker lot ({self.min_volume:.2f} lot). "
                     f"Minimum risk is ${min_lot_risk_usd:.2f} ({min_lot_risk_pct:.2f}% of equity), "
-                    f"which exceeds the {self.max_risk_pct:.1f}% risk ceiling (${max_allowed_risk_usd:.2f})."
-                )
+                    f"which exceeds the {effective_risk_pct:.2f}% risk ceiling (${max_allowed_risk_usd:.2f})."
+                ),
+                k_vol=k_vol,
+                conviction_factor=conviction_factor,
+                effective_risk_pct=effective_risk_pct,
             )
 
         # If calculated_lot >= min_volume, compute exact exposure
@@ -213,7 +287,10 @@ class RiskGovernor:
                 lot_size=0.0,
                 risk_usd=actual_risk_usd,
                 risk_pct=actual_risk_pct,
-                veto_reason=f"VETO: Actual risk ({actual_risk_pct:.2f}%) exceeds maximum allowed {self.max_risk_pct:.1f}%."
+                veto_reason=f"VETO: Actual risk ({actual_risk_pct:.2f}%) exceeds maximum allowed {self.max_risk_pct:.1f}%.",
+                k_vol=k_vol,
+                conviction_factor=conviction_factor,
+                effective_risk_pct=effective_risk_pct,
             )
 
         return RiskApproval(
@@ -221,5 +298,8 @@ class RiskGovernor:
             lot_size=calculated_lot,
             risk_usd=actual_risk_usd,
             risk_pct=actual_risk_pct,
-            veto_reason=None
+            veto_reason=None,
+            k_vol=k_vol,
+            conviction_factor=conviction_factor,
+            effective_risk_pct=effective_risk_pct,
         )

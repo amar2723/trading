@@ -30,13 +30,14 @@ logger = logging.getLogger("LiquidityMap")
 @dataclass
 class LiquidityReferenceLevel:
     level_id: str
-    level_type: str          # "SESSION_HIGH", "SESSION_LOW", "PDH", "PDL", "PDC", "VWAP", "VP_VAH", "VP_VAL", "VP_POC"
-    session: str             # "ASIA", "LONDON", "NY", "PRIOR_DAY", "PROFILE"
+    level_type: str          # "SESSION_HIGH", "SESSION_LOW", "PDH", "PDL", "PDC", "PWH", "PWL", "PWC", "NYMO", "VWAP", "VP_VAH", "VP_VAL", "VP_POC"
+    session: str             # "ASIA", "LONDON", "NY", "PRIOR_DAY", "HTF_DAILY", "HTF_WEEKLY", "PROFILE", "NYMO"
     price: float
     volume_weight: float     # Tick volume accumulation proxy
     established_time: str
     is_active: bool = True
     evidence: str = ""
+    tier: str = "TIER_2_SESSION"  # "TIER_1_INSTITUTIONAL" or "TIER_2_SESSION"
 
     def to_dict(self) -> dict:
         return {
@@ -48,6 +49,7 @@ class LiquidityReferenceLevel:
             "established_time": self.established_time,
             "is_active": self.is_active,
             "evidence": self.evidence,
+            "tier": self.tier,
         }
 
 
@@ -151,10 +153,140 @@ class LiquidityMap:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         return tr.rolling(period, min_periods=1).mean()
 
-    def compute_session_levels(self, df: pd.DataFrame) -> list[LiquidityReferenceLevel]:
+    def compute_htf_levels(self, df_h1: pd.DataFrame) -> list[LiquidityReferenceLevel]:
+        """
+        Computes Higher Timeframe (HTF) institutional benchmarks:
+        1. Prior Day High (PDH), Prior Day Low (PDL), Prior Day Close (PDC)
+        2. Prior Week High (PWH), Prior Week Low (PWL), Prior Week Close (PWC)
+        3. New York Midnight Open (NYMO: 00:00 EST / 05:00 UTC)
+        All tagged as TIER_1_INSTITUTIONAL liquidity reference levels.
+        """
+        levels: list[LiquidityReferenceLevel] = []
+        if df_h1 is None or len(df_h1) < 5:
+            return levels
+
+        ts = pd.to_datetime(df_h1["timestamp"], utc=True)
+        df_work = df_h1.copy()
+        df_work["ts_utc"] = ts
+        df_work["date"] = ts.dt.date
+        df_work["year_week"] = (
+            ts.dt.isocalendar().year.astype(str) + "_" + ts.dt.isocalendar().week.astype(str)
+        )
+
+        unique_dates = sorted(df_work["date"].unique())
+        current_date = unique_dates[-1]
+
+        # 1. Prior Day Extremes
+        if len(unique_dates) >= 2:
+            prior_date = unique_dates[-2]
+            df_prior = df_work[df_work["date"] == prior_date]
+            if not df_prior.empty:
+                pdh = float(df_prior["high"].max())
+                pdl = float(df_prior["low"].min())
+                pdc = float(df_prior["close"].iloc[-1])
+                pd_vol = float(df_prior["tick_volume"].sum()) if "tick_volume" in df_prior.columns else 2000.0
+
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PDH_{prior_date}",
+                    level_type="PDH",
+                    session="HTF_DAILY",
+                    price=pdh,
+                    volume_weight=pd_vol,
+                    established_time=str(df_prior["ts_utc"].iloc[-1]),
+                    evidence=f"Prior Day High ({prior_date}) Institutional Buy-Side Pool",
+                    tier="TIER_1_INSTITUTIONAL",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PDL_{prior_date}",
+                    level_type="PDL",
+                    session="HTF_DAILY",
+                    price=pdl,
+                    volume_weight=pd_vol,
+                    established_time=str(df_prior["ts_utc"].iloc[-1]),
+                    evidence=f"Prior Day Low ({prior_date}) Institutional Sell-Side Pool",
+                    tier="TIER_1_INSTITUTIONAL",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PDC_{prior_date}",
+                    level_type="PDC",
+                    session="HTF_DAILY",
+                    price=pdc,
+                    volume_weight=pd_vol,
+                    established_time=str(df_prior["ts_utc"].iloc[-1]),
+                    evidence=f"Prior Day Close ({prior_date}) Equilibrium Benchmark",
+                    tier="TIER_1_INSTITUTIONAL",
+                ))
+
+        # 2. Prior Week Extremes
+        unique_weeks = sorted(df_work["year_week"].unique())
+        if len(unique_weeks) >= 2:
+            prior_week = unique_weeks[-2]
+            df_pweek = df_work[df_work["year_week"] == prior_week]
+            if not df_pweek.empty:
+                pwh = float(df_pweek["high"].max())
+                pwl = float(df_pweek["low"].min())
+                pwc = float(df_pweek["close"].iloc[-1])
+                pw_vol = float(df_pweek["tick_volume"].sum()) if "tick_volume" in df_pweek.columns else 10000.0
+
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PWH_{prior_week}",
+                    level_type="PWH",
+                    session="HTF_WEEKLY",
+                    price=pwh,
+                    volume_weight=pw_vol,
+                    established_time=str(df_pweek["ts_utc"].iloc[-1]),
+                    evidence=f"Prior Week High (Wk {prior_week}) Major Institutional Pool",
+                    tier="TIER_1_INSTITUTIONAL",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PWL_{prior_week}",
+                    level_type="PWL",
+                    session="HTF_WEEKLY",
+                    price=pwl,
+                    volume_weight=pw_vol,
+                    established_time=str(df_pweek["ts_utc"].iloc[-1]),
+                    evidence=f"Prior Week Low (Wk {prior_week}) Major Institutional Pool",
+                    tier="TIER_1_INSTITUTIONAL",
+                ))
+                levels.append(LiquidityReferenceLevel(
+                    level_id=f"PWC_{prior_week}",
+                    level_type="PWC",
+                    session="HTF_WEEKLY",
+                    price=pwc,
+                    volume_weight=pw_vol,
+                    established_time=str(df_pweek["ts_utc"].iloc[-1]),
+                    evidence=f"Prior Week Close (Wk {prior_week}) Weekly Pivot",
+                    tier="TIER_1_INSTITUTIONAL",
+                ))
+
+        # 3. New York Midnight Open (05:00 UTC)
+        df_today = df_work[df_work["date"] == current_date]
+        if not df_today.empty:
+            nymo_candidates = df_today[df_today["ts_utc"].dt.hour == 5]
+            if not nymo_candidates.empty:
+                nymo_price = float(nymo_candidates.iloc[0]["open"])
+                nymo_time = str(nymo_candidates.iloc[0]["ts_utc"])
+            else:
+                nymo_price = float(df_today.iloc[0]["open"])
+                nymo_time = str(df_today.iloc[0]["ts_utc"])
+
+            levels.append(LiquidityReferenceLevel(
+                level_id=f"NYMO_{current_date}",
+                level_type="NYMO",
+                session="NYMO",
+                price=nymo_price,
+                volume_weight=3000.0,
+                established_time=nymo_time,
+                evidence="New York Midnight Open (05:00 UTC / 00:00 EST) Institutional Anchor",
+                tier="TIER_1_INSTITUTIONAL",
+            ))
+
+        return levels
+
+    def compute_session_levels(self, df: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> list[LiquidityReferenceLevel]:
         """
         Computes Asian (00-06 UTC), London (07-10 UTC), and NY (12-16 UTC) extremes,
-        plus Prior Day High, Low, and Close.
+        plus Prior Day High, Low, and Close (and HTF PWH/PWL/NYMO when df_h1 is provided).
         """
         levels: list[LiquidityReferenceLevel] = []
         if df is None or len(df) < 15:
@@ -169,8 +301,15 @@ class LiquidityMap:
         unique_dates = df_work["date"].unique()
         current_date = unique_dates[-1]
 
-        # Prior Day Extremes (if available)
-        if len(unique_dates) >= 2:
+        # If df_h1 is provided, extract higher-timeframe authoritative levels
+        has_htf_pd = False
+        if df_h1 is not None and not df_h1.empty:
+            htf_levels = self.compute_htf_levels(df_h1)
+            levels.extend(htf_levels)
+            has_htf_pd = any(lvl.level_type in ["PDH", "PDL", "PDC"] for lvl in htf_levels)
+
+        # Prior Day Extremes from intraday df (if not already sourced from H1)
+        if not has_htf_pd and len(unique_dates) >= 2:
             prior_date = unique_dates[-2]
             df_prior = df_work[df_work["date"] == prior_date]
             if not df_prior.empty:
@@ -187,6 +326,7 @@ class LiquidityMap:
                     volume_weight=pd_vol,
                     established_time=str(df_prior["ts_utc"].iloc[-1]),
                     evidence="Prior Day High benchmark",
+                    tier="TIER_1_INSTITUTIONAL",
                 ))
                 levels.append(LiquidityReferenceLevel(
                     level_id=f"PDL_{prior_date}",
@@ -196,6 +336,7 @@ class LiquidityMap:
                     volume_weight=pd_vol,
                     established_time=str(df_prior["ts_utc"].iloc[-1]),
                     evidence="Prior Day Low benchmark",
+                    tier="TIER_1_INSTITUTIONAL",
                 ))
                 levels.append(LiquidityReferenceLevel(
                     level_id=f"PDC_{prior_date}",
@@ -205,6 +346,7 @@ class LiquidityMap:
                     volume_weight=pd_vol,
                     established_time=str(df_prior["ts_utc"].iloc[-1]),
                     evidence="Prior Day Close benchmark",
+                    tier="TIER_1_INSTITUTIONAL",
                 ))
 
         # Intraday Sessions for current date
@@ -224,6 +366,7 @@ class LiquidityMap:
                     volume_weight=asia_vol,
                     established_time=str(df_asia["ts_utc"].iloc[-1]),
                     evidence="Asian session range high accumulation",
+                    tier="TIER_2_SESSION",
                 ))
                 levels.append(LiquidityReferenceLevel(
                     level_id=f"ASIA_LOW_{current_date}",
@@ -233,6 +376,7 @@ class LiquidityMap:
                     volume_weight=asia_vol,
                     established_time=str(df_asia["ts_utc"].iloc[-1]),
                     evidence="Asian session range low accumulation",
+                    tier="TIER_2_SESSION",
                 ))
 
             # 2. London Killzone (07:00 - 10:00 UTC)
@@ -249,6 +393,7 @@ class LiquidityMap:
                     volume_weight=lon_vol,
                     established_time=str(df_london["ts_utc"].iloc[-1]),
                     evidence="London Killzone peak expansion high",
+                    tier="TIER_2_SESSION",
                 ))
                 levels.append(LiquidityReferenceLevel(
                     level_id=f"LON_LOW_{current_date}",
@@ -258,6 +403,7 @@ class LiquidityMap:
                     volume_weight=lon_vol,
                     established_time=str(df_london["ts_utc"].iloc[-1]),
                     evidence="London Killzone peak expansion low",
+                    tier="TIER_2_SESSION",
                 ))
 
         return levels
@@ -357,7 +503,7 @@ class LiquidityMap:
             "vp_val": val_price,
         }
 
-    def evaluate_sweeps_and_structure(self, df: pd.DataFrame) -> tuple[list[SweepEvent], str]:
+    def evaluate_sweeps_and_structure(self, df: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> tuple[list[SweepEvent], str]:
         """
         Evaluates recent completed price action against LiquidityReferenceLevels.
         Enforces No-Trade Stop Run Gate: single-bar wicks are tagged UNCONFIRMED_WICK.
@@ -372,7 +518,7 @@ class LiquidityMap:
         if is_breaker:
             return events, breaker_msg
 
-        levels = self.compute_session_levels(df)
+        levels = self.compute_session_levels(df, df_h1=df_h1)
         if not levels:
             return events, "NO_ACTIVE_LEVELS"
 
@@ -395,7 +541,7 @@ class LiquidityMap:
 
         for lvl in levels:
             # Check Bearish Sweep (Sweep above resistance level)
-            if lvl.level_type in ["SESSION_HIGH", "PDH", "VP_VAH"]:
+            if lvl.level_type in ["SESSION_HIGH", "PDH", "PWH", "VP_VAH"]:
                 min_reach = lvl.price + (self.min_sweep_atr_mult * atr_val)
                 max_reach = lvl.price + (self.max_sweep_atr_mult * atr_val)
 
@@ -434,7 +580,7 @@ class LiquidityMap:
                     ))
 
             # Check Bullish Sweep (Sweep below support level)
-            if lvl.level_type in ["SESSION_LOW", "PDL", "VP_VAL"]:
+            if lvl.level_type in ["SESSION_LOW", "PDL", "PWL", "NYMO", "VP_VAL"]:
                 min_dip = lvl.price - (self.min_sweep_atr_mult * atr_val)
                 max_dip = lvl.price - (self.max_sweep_atr_mult * atr_val)
 
@@ -473,7 +619,7 @@ class LiquidityMap:
 
         return events, status_verdict
 
-    def get_pre_sweep_liquidity_watchlist(self, df: pd.DataFrame) -> dict:
+    def get_pre_sweep_liquidity_watchlist(self, df: pd.DataFrame, df_h1: pd.DataFrame | None = None) -> dict:
         """
         Maps all active institutional liquidity pools BEFORE they are swept.
         Returns:
@@ -483,12 +629,13 @@ class LiquidityMap:
         - fair_value_targets: Session VWAP, POC, VAH, VAL.
         - nearest_bsl: The closest overhead pool to be swept for a potential SHORT setup.
         - nearest_ssl: The closest underlying pool to be swept for a potential LONG setup.
+        - htf_levels: Dict containing PDH, PDL, PDC, PWH, PWL, NYMO benchmarks.
         """
         if df is None or len(df) < 5:
             return {}
 
         current_price = float(df["close"].iloc[-1])
-        levels = self.compute_session_levels(df)
+        levels = self.compute_session_levels(df, df_h1=df_h1)
         vwap_dict = self.compute_anchored_vwap(df)
         vp_dict = self.compute_volume_profile(df)
 
@@ -501,13 +648,15 @@ class LiquidityMap:
             levels.append(LiquidityReferenceLevel(
                 level_id="VP_VAH_24H", level_type="VP_VAH", session="PROFILE",
                 price=round(vp_dict["vp_vah"], 2), volume_weight=1500.0,
-                established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area High"
+                established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area High",
+                tier="TIER_2_SESSION",
             ))
         if "vp_val" in vp_dict and vp_dict["vp_val"] > 0:
             levels.append(LiquidityReferenceLevel(
                 level_id="VP_VAL_24H", level_type="VP_VAL", session="PROFILE",
                 price=round(vp_dict["vp_val"], 2), volume_weight=1500.0,
-                established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area Low"
+                established_time=str(df["timestamp"].iloc[-1]), evidence="24H Value Area Low",
+                tier="TIER_2_SESSION",
             ))
 
         # Timing & Institutional Killzone Schedule
@@ -558,10 +707,13 @@ class LiquidityMap:
                 timing_status = "UPCOMING_SESSION"
                 timing_eta = f"Projected {next_window_name} (~{est_minutes // 60}h {est_minutes % 60}m / {est_time_ist.strftime('%H:%M IST')})"
 
+            pool_tier = getattr(lvl, "tier", "TIER_1_INSTITUTIONAL" if lvl.level_type in ["PDH", "PDL", "PWH", "PWL", "NYMO"] else "TIER_2_SESSION")
+
             pool_entry = {
                 "level_id": lvl.level_id,
                 "level_type": lvl.level_type,
                 "session": lvl.session,
+                "tier": pool_tier,
                 "price": lvl.price,
                 "distance_usd": dist_usd,
                 "distance_pips": dist_pips,
@@ -588,6 +740,15 @@ class LiquidityMap:
         nearest_bsl = bsl_list[0] if bsl_list else None
         nearest_ssl = ssl_list[0] if ssl_list else None
 
+        htf_summary = {
+            "pdh": next((lvl.price for lvl in levels if lvl.level_type == "PDH"), None),
+            "pdl": next((lvl.price for lvl in levels if lvl.level_type == "PDL"), None),
+            "pdc": next((lvl.price for lvl in levels if lvl.level_type == "PDC"), None),
+            "pwh": next((lvl.price for lvl in levels if lvl.level_type == "PWH"), None),
+            "pwl": next((lvl.price for lvl in levels if lvl.level_type == "PWL"), None),
+            "nymo": next((lvl.price for lvl in levels if lvl.level_type == "NYMO"), None),
+        }
+
         return {
             "current_price": current_price,
             "atr_14": round(atr_val, 2),
@@ -601,6 +762,7 @@ class LiquidityMap:
             "nearest_ssl": nearest_ssl,
             "all_bsl_pools": bsl_list,
             "all_ssl_pools": ssl_list,
+            "htf_levels": htf_summary,
             "fair_value_targets": {
                 "session_vwap": vwap_dict.get("vwap"),
                 "poc": vp_dict.get("vp_poc"),

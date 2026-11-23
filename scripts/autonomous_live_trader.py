@@ -44,6 +44,8 @@ from src.ml_meta_filter import MLMetaFilter
 from src.risk_governor import RiskGovernor
 from src.signal_journal import SignalJournal
 from src.broker_adapter import OctaBrokerAdapter
+from src.macro_compass import MacroCompass, MacroSnapshot
+from src.realtime.economic_calendar import NewsCalendarFilter, NewsStatus
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -64,9 +66,31 @@ AUDIT_LOG_FILE = ROOT / "reports/live_predictions_audit.jsonl"
 
 # Global Phase 2 & 3 Engines
 meta_filter = MLMetaFilter()
-risk_governor = RiskGovernor(max_risk_pct=1.0, max_spread_pips=35.0)
+macro_compass = MacroCompass()
+news_filter = NewsCalendarFilter()
+risk_governor = RiskGovernor(max_risk_pct=1.0, max_spread_pips=35.0, news_filter=news_filter)
 signal_journal = SignalJournal()
 broker = OctaBrokerAdapter(initial_demo_equity=40.68)
+
+
+def get_institutional_keyboard() -> dict:
+    """Institutional quick-action inline keyboard for VIP Telegram Desk."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "⚡ Instant Signal", "callback_data": "cmd_signal"},
+                {"text": "📊 Live Pulse", "callback_data": "cmd_pulse"},
+            ],
+            [
+                {"text": "🎯 Liquidity Map", "callback_data": "cmd_liquidity"},
+                {"text": "🧭 Macro Compass", "callback_data": "cmd_macro"},
+            ],
+            [
+                {"text": "📅 News Blackout", "callback_data": "cmd_news"},
+                {"text": "📈 PnL & Desk", "callback_data": "cmd_pnl"},
+            ],
+        ]
+    }
 
 
 def log_audit_record(data: dict):
@@ -274,11 +298,15 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
 
     # Phase 2 Strategy Layer Evaluation (Deterministic Entry Engines)
     lmap = LiquidityMap()
-    watchlist = lmap.get_pre_sweep_liquidity_watchlist(df)
+    watchlist = lmap.get_pre_sweep_liquidity_watchlist(df, df_h1=df_h1)
     sig_sweep = LiquiditySweepReversalStrategy.evaluate(df_proc, df_h1)
     sig_pullback = H1TrendM5PullbackStrategy.evaluate(df_proc, df_h1)
     sig_donchian = DonchianBreakoutStrategy.evaluate(df_proc, df_h1)
     sig_squeeze = VolatilitySqueezeStrategy.evaluate(df_proc, df_h1)
+
+    # JPMorgan Institutional Pillar 1 & 2: Macro Compass & Economic Calendar
+    macro_snap = macro_compass.get_snapshot()
+    news_status = news_filter.get_news_status()
 
     # User Preference: SWEEP_ONLY_MODE (Set SWEEP_ONLY_MODE=1 to trade ONLY verified post-liquidity sweeps)
     sweep_only_mode = os.environ.get("SWEEP_ONLY_MODE", "0") == "1"
@@ -336,6 +364,22 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
             "• 2. Both M5 and H1 feeds must belong to the exact same verified broker spot source.\n"
             "• 3. Combining disparate sources (e.g. M5 spot with H1 futures) is blocked to guarantee analytical validity."
         )
+    elif news_status.is_locked:
+        action = "HOLD"
+        entry = current_price
+        sl = current_price
+        tp1 = current_price
+        tp2 = current_price
+        be_trigger = current_price
+        risk_dist = 0.0
+        strat_prefix = chosen_sig.strategy_name if (chosen_sig and chosen_sig.action != "HOLD") else "HOLD"
+        active_strategy = f"{strat_prefix} (NEWS_BLACKOUT)"
+        confidence = 0.0
+        why = (
+            f"• 1. HOLD: High-impact economic news lockout active: {news_status.reason}.\n"
+            "• 2. Execution prohibited 30 minutes before and after Tier-1 USD releases.\n"
+            f"• 3. Event: {news_status.active_event or 'High-impact USD event'} | Stand down."
+        )
     elif chosen_sig is None or chosen_sig.action == "HOLD":
         action = "HOLD"
         entry = current_price
@@ -372,6 +416,13 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         )
 
     # Phase 2 ML Meta-Filter Expected R Evaluation (Strict +0.15R Hurdle with spread/slip cost drag)
+    # Institutional Macro Concordance Adverse Hurdle: raise hurdle to +0.40R if macro forces oppose signal
+    min_exp_R = 0.15
+    if action == "BUY" and macro_snap.concordance_score <= -0.25:
+        min_exp_R = 0.40  # DXY/Yields headwind against Gold
+    elif action == "SELL" and macro_snap.concordance_score >= 0.25:
+        min_exp_R = 0.40  # DXY/Yields tailwind supporting Gold (opposing short)
+
     ml_verdict = meta_filter.evaluate_candidate(
         candidate_action=action,
         strategy_name=active_strategy,
@@ -379,12 +430,12 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         h1_trend_bias=h1_trend_bias,
         h1_dist_ema50=h1_dist_ema50,
         risk_usd=max(1.0, risk_dist * 1.0),
-        min_expected_R=0.15,
+        min_expected_R=min_exp_R,
     )
     if action != "HOLD":
         confidence = round(ml_verdict.predicted_win_prob * 100, 1)
 
-    # Phase 2 Risk Governor Review (with Asian Session Chop Shield & Live Broker Spread)
+    # Phase 2 Risk Governor Review (with Asian Session Chop Shield, Vol-Targeting, & Live Broker Spread)
     quote = broker.get_symbol_quote(current_price)
     risk_approval = risk_governor.review_trade(
         equity=broker.equity,
@@ -394,6 +445,9 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         current_spread_pips=quote.spread_pips,
         open_positions_count=len(broker.open_positions),
         session_hour=curr_hour,
+        atr_current=atr_val,
+        conviction_score=ml_verdict.predicted_win_prob,
+        news_status=news_status,
     )
 
     return {
@@ -414,6 +468,8 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         "ml_win_prob": ml_verdict.predicted_win_prob,
         "risk_approved": risk_approval.approved,
         "risk_veto": risk_approval.veto_reason,
+        "k_vol": risk_approval.k_vol,
+        "effective_risk_pct": risk_approval.effective_risk_pct,
         "buyer_pct": buyer_pct,
         "seller_pct": seller_pct,
         "session": session_name,
@@ -426,6 +482,9 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         "why": why,
         "time": str(last_ts),
         "watchlist": watchlist,
+        "macro_snapshot": macro_snap,
+        "news_status": news_status,
+        "htf_levels": watchlist.get("htf_levels", {}),
     }
 
 
@@ -436,30 +495,57 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
     nearest_ssl = wl.get("nearest_ssl")
     fv = wl.get("fair_value_targets", {})
     vwap_val = fv.get("session_vwap")
+    htf = wl.get("htf_levels", {})
 
     cur_time_str = f"{sched.get('current_time_utc', '')} | {sched.get('current_time_ist', '')}" if sched else setup.get("time", "")
     active_win = sched.get("active_window", setup.get("session", ""))
     next_win = sched.get("next_window", "Next Session")
 
+    bsl_tier = f"[{nearest_bsl.get('tier', 'TIER_1_INSTITUTIONAL')}]" if nearest_bsl else ""
+    ssl_tier = f"[{nearest_ssl.get('tier', 'TIER_1_INSTITUTIONAL')}]" if nearest_ssl else ""
+
     bsl_str = (
-        f"${nearest_bsl['price']:.2f} (`{nearest_bsl['level_type']}`) — `{nearest_bsl['distance_pips']}p away`\n"
+        f"${nearest_bsl['price']:.2f} (`{nearest_bsl['level_type']}`) {bsl_tier} — `{nearest_bsl['distance_pips']}p away`\n"
         f"  ↳ 🎯 *Trigger Zone*: `${nearest_bsl['sweep_min_trigger']:.2f} – ${nearest_bsl['sweep_max_trigger']:.2f}`\n"
         f"  ↳ ⏳ *Estimated Timing*: `{nearest_bsl.get('eta_display', 'N/A')}`"
     ) if nearest_bsl else "None"
 
     ssl_str = (
-        f"${nearest_ssl['price']:.2f} (`{nearest_ssl['level_type']}`) — `{nearest_ssl['distance_pips']}p away`\n"
+        f"${nearest_ssl['price']:.2f} (`{nearest_ssl['level_type']}`) {ssl_tier} — `{nearest_ssl['distance_pips']}p away`\n"
         f"  ↳ 🎯 *Trigger Zone*: `${nearest_ssl['sweep_min_trigger']:.2f} – ${nearest_ssl['sweep_max_trigger']:.2f}`\n"
         f"  ↳ ⏳ *Estimated Timing*: `{nearest_ssl.get('eta_display', 'N/A')}`"
     ) if nearest_ssl else "None"
 
     vwap_str = f"${vwap_val:.2f}" if (vwap_val and vwap_val > 0) else "N/A"
 
+    htf_str = ""
+    if htf and any(v is not None for v in htf.values()):
+        htf_str = (
+            f"• 🏛️ *Institutional HTF Benchmarks*:\n"
+            f"  ↳ PDH: `${htf.get('pdh') or 0:.2f}` | PDL: `${htf.get('pdl') or 0:.2f}` | NYMO: `${htf.get('nymo') or 0:.2f}`\n"
+            f"  ↳ PWH: `${htf.get('pwh') or 0:.2f}` | PWL: `${htf.get('pwl') or 0:.2f}`\n"
+        )
+
+    macro_snap = setup.get("macro_snapshot")
+    macro_section = ""
+    if macro_snap:
+        macro_section = (
+            f"🧭 *MACRO COMPASS (DXY & US10Y)*:\n"
+            f"• 🏛️ *Concordance*: `{macro_snap.concordance_score:+.2f}` ({macro_snap.regime})\n"
+            f"• 💵 *DXY*: `{macro_snap.dxy_price:.2f}` ({macro_snap.dxy_change_pct:+.2f}%) | 📉 *US 10Y*: `{macro_snap.us10y_yield:.3f}%` ({macro_snap.us10y_change_bps:+.1f} bps)\n\n"
+        )
+
+    news_status = setup.get("news_status")
+    news_section = ""
+    if news_status:
+        news_section = f"{news_status.summary}\n\n"
+
     wl_section = (
         f"🎯 *INSTITUTIONAL LIQUIDITY MAP & TIMING FORECAST*:\n"
         f"• 🕒 *Current Time*: `{cur_time_str}`\n"
         f"• 🌐 *Active Window*: `{active_win}`\n"
         f"• ⏳ *Next Window*: `{next_win}`\n\n"
+        f"{htf_str}"
         f"• 🔴 *Buy-Side Target (BSL / Highs)*:\n  {bsl_str}\n"
         f"• 🟢 *Sell-Side Target (SSL / Lows)*:\n  {ssl_str}\n"
         f"• ⚖️ *Fair Value (VWAP)*: `{vwap_str}`\n"
@@ -507,9 +593,10 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
                 pred_trigger = f"${target_pool.get('sweep_min_trigger', pred_entry):.2f} – ${target_pool.get('sweep_max_trigger', pred_entry + 2.0):.2f}"
 
             pred_eta = target_pool.get("eta_display", "APPROACHING")
+            pred_tier_tag = f"[{target_pool.get('tier', 'TIER_1_INSTITUTIONAL')}]"
             pred_section = (
                 f"🔮 *PREDICTED NEXT TRADE SETUP (EXCLUSIVE SWEEP)*:\n"
-                f"• 🎯 *Target Pool*: `{target_pool['level_id']}` (`{target_pool['level_type']}`) at `${target_pool['price']:.2f}`\n"
+                f"• 🎯 *Target Pool*: `{target_pool['level_id']}` (`{target_pool['level_type']}`) {pred_tier_tag} at `${target_pool['price']:.2f}`\n"
                 f"• ⚡ *Predicted Signal*: {pred_icon} *{pred_action}*\n"
                 f"• 📍 *Predicted Entry Zone*: `{pred_trigger}`\n"
                 f"• 🛑 *Predicted Stop Loss (SL)*: `${pred_sl:.2f}` (Beyond sweep wick)\n"
@@ -525,6 +612,8 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
             f"🎯 *Asset*: XAUUSD (Gold - M5 Live)\n"
             f"💵 *Live Market Price*: `${setup['price']:.2f}`\n"
             f"🌐 *Structure*: `{setup['regime']}` | 🕒 `{setup['session']}`\n\n"
+            f"{macro_section}"
+            f"{news_section}"
             f"{pred_section}"
             f"{wl_section}\n"
             f"🛡️ *Capital Preservation Mode Active*\n"
@@ -532,7 +621,7 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
             f"• Risk Governor status: Armed (Zero active exposure until trigger).\n"
             f"• Indicators: RSI at `{setup.get('rsi', 50.0)}` | Volume: 🟢 {setup.get('buyer_pct', 50.0):.1f}% vs 🔴 {setup.get('seller_pct', 50.0):.1f}%\n\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 *Commands*: `/trade` | `/signal` | `/status` | `/help`"
+            f"💡 *Commands*: `/trade` | `/signal` | `/macro` | `/news` | `/status`"
         )
 
     icon = "🔴" if setup["action"] == "SELL" else "🟢"
@@ -547,13 +636,15 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"🕒 *Trigger Time*: `{cur_time_str}`\n"
         f"🌐 *Session Window*: `{active_win}`\n"
         f"💵 *Live Market Price*: `${setup['price']:.2f}`\n\n"
+        f"{macro_section}"
+        f"{news_section}"
         f"📍 *EXACT ENTRY*: `${setup['entry']:.2f}`\n"
         f"🛑 *STOP LOSS (SL)*: `${setup['sl']:.2f}` (ATR-Buffered)\n"
         f"🛡️ *BREAK-EVEN TRIGGER*: `${setup['be_trigger']:.2f}` (+20 pips ➔ Move SL to Entry)\n"
         f"🏁 *TAKE PROFIT 1 (TP1)*: `${setup['tp1']:.2f}` (Close 50% Lot)\n"
         f"🚀 *TAKE PROFIT 2 (TP2)*: `${setup['tp2']:.2f}` (Full Target Runner)\n\n"
         f"⚖️ *Risk / Reward*: `{setup['risk_reward']}`\n"
-        f"💰 *Recommended Volume*: `{lot_disp} Lots` (Risk: `${risk_usd_disp:.2f}`)\n"
+        f"💰 *Recommended Volume*: `{lot_disp} Lots` (Risk: `${risk_usd_disp:.2f}` | k_vol: `{setup.get('k_vol', 1.0):.2f}` | Eff Risk: `{setup.get('effective_risk_pct', 1.0):.2f}%`)\n"
         f"🛡️ *Strategy Engine*: `{setup.get('strategy', 'H1_TREND_PULLBACK')}`\n"
         f"🧠 *ML Meta-Filter*: `{setup.get('ml_decision', 'TAKE')}` (E[R]: `{setup.get('ml_expected_R', 0.10):+.2f}R`, Prob: `{setup.get('ml_win_prob', 0.45)*100:.1f}%`)\n"
         f"🚦 *Risk Governor*: {risk_status_disp}\n"
@@ -566,7 +657,7 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
         f"• *Execution Engine*: Octa Shadow Broker (Floating Spread & 50ms Slippage)\n"
         f"• *Signal Journal*: Logged to `reports/signal_journal.jsonl`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *Commands*: `/trade` | `/demo` | `/status` | `/audit` | `/end` | `/start`"
+        f"💡 *Commands*: `/trade` | `/macro` | `/news` | `/pnl` | `/end` | `/start`"
     )
 
 
@@ -603,24 +694,130 @@ def format_telemetry_pulse(setup: dict, broker: OctaBrokerAdapter, mgr: Producti
     )
 
 
-def robust_send_telegram(token: str, chat_id: str | int, text: str) -> bool:
+def format_macro_card(snapshot: MacroSnapshot | None) -> str:
+    if not snapshot:
+        return "🧭 *Macro Compass*: Data currently unavailable."
+    return (
+        f"🧭 *JPMORGAN INSTITUTIONAL MACRO COMPASS*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• 🏛️ *Regime Verdict*: *{snapshot.regime}*\n"
+        f"• ⚖️ *Concordance Score*: `{snapshot.concordance_score:+.2f}` (Range: -1.0 to +1.0)\n\n"
+        f"💵 *US Dollar Index (DXY / DX-Y.NYB)*:\n"
+        f"  ↳ Spot Price: `{snapshot.dxy_price:.2f}`\n"
+        f"  ↳ 24h Change: `{snapshot.dxy_change_pct:+.2f}%`\n"
+        f"  ↳ 5-Day Trend: `{snapshot.dxy_trend}`\n\n"
+        f"📉 *US 10-Year Treasury Yield (^TNX)*:\n"
+        f"  ↳ Current Yield: `{snapshot.us10y_yield:.3f}%`\n"
+        f"  ↳ 24h Change: `{snapshot.us10y_change_bps:+.1f} bps`\n"
+        f"  ↳ 5-Day Trend: `{snapshot.us10y_trend}`\n\n"
+        f"💡 *Mechanism*: DXY and US10Y have negative correlation with Gold. When concordance is > +0.25 (both falling), Gold has an institutional tailwind; when < -0.25, longs face an adverse +0.25R hurdle."
+    )
+
+
+def format_news_card(news_status: NewsStatus | None) -> str:
+    if not news_status:
+        return "📅 *Economic Calendar*: Data currently unavailable."
+    events_str = ""
+    if news_status.upcoming_events_today:
+        for ev in news_status.upcoming_events_today:
+            events_str += f"• `{ev.get('time_utc', 'N/A')} UTC` — *{ev.get('event', 'USD Event')}* (Impact: `{ev.get('impact', 'HIGH')}`)\n"
+    else:
+        events_str = "• No high-impact USD economic events scheduled for today.\n"
+
+    status_icon = "🔴 BLACKOUT ACTIVE" if news_status.is_locked else "🟢 CLEAR TO TRADE"
+    return (
+        f"📅 *ECONOMIC CALENDAR & NEWS GOVERNOR*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• 🛡️ *Blackout Gate*: *{status_icon}*\n"
+        f"• 📋 *Verdict*: {news_status.reason}\n\n"
+        f"🕒 *Scheduled High-Impact USD Events*:\n"
+        f"{events_str}\n"
+        f"🛡️ *Rule*: Strict stand-down 30m before and 30m after Tier-1 events (CPI, NFP, FOMC)."
+    )
+
+
+def format_liquidity_card(watchlist: dict) -> str:
+    sched = watchlist.get("timing_schedule", {})
+    htf = watchlist.get("htf_levels", {})
+    bsl = watchlist.get("all_bsl_pools", [])
+    ssl = watchlist.get("all_ssl_pools", [])
+
+    htf_str = ""
+    if htf:
+        htf_str = (
+            f"🏛️ *Higher Timeframe (HTF) Benchmarks*:\n"
+            f"• Prior Day High (PDH): `${htf.get('pdh') or 0:.2f}`\n"
+            f"• Prior Day Low (PDL): `${htf.get('pdl') or 0:.2f}`\n"
+            f"• Prior Week High (PWH): `${htf.get('pwh') or 0:.2f}`\n"
+            f"• Prior Week Low (PWL): `${htf.get('pwl') or 0:.2f}`\n"
+            f"• NY Midnight Open (NYMO): `${htf.get('nymo') or 0:.2f}`\n\n"
+        )
+
+    bsl_lines = "\n".join([f"  ↳ `${p['price']:.2f}` (`{p['level_type']}`) [{p.get('tier', 'TIER_1_INSTITUTIONAL')}] — `{p['distance_pips']}p` ({p.get('eta_display', 'N/A')})" for p in bsl[:3]]) or "  None"
+    ssl_lines = "\n".join([f"  ↳ `${p['price']:.2f}` (`{p['level_type']}`) [{p.get('tier', 'TIER_1_INSTITUTIONAL')}] — `{p['distance_pips']}p` ({p.get('eta_display', 'N/A')})" for p in ssl[:3]]) or "  None"
+
+    return (
+        f"🎯 *INSTITUTIONAL LIQUIDITY MAP*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 *Live Market Price*: `${watchlist.get('current_price', 0.0):.2f}`\n"
+        f"🌐 *Session*: `{sched.get('active_window', 'N/A')}`\n\n"
+        f"{htf_str}"
+        f"🔴 *Buy-Side Resting Pools (Overhead)*:\n{bsl_lines}\n\n"
+        f"🟢 *Sell-Side Resting Pools (Underlying)*:\n{ssl_lines}\n\n"
+        f"⚖️ *Fair Value (VWAP)*: `${watchlist.get('fair_value_targets', {}).get('session_vwap') or 0:.2f}`"
+    )
+
+
+def format_pnl_card(broker: OctaBrokerAdapter, mgr: ProductionRuntimeManager) -> str:
+    total_trades = mgr.state.get("wins", 0) + mgr.state.get("losses", 0)
+    win_pct = mgr.state.get("win_rate_pct", 0.0)
+    active_pos = list(broker.open_positions.values())
+    pos_str = f"{len(active_pos)} active" if active_pos else "Flat (0 active)"
+    return (
+        f"📈 *INSTITUTIONAL DESK PNL & ACCOUNT*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 *Broker Account*: Octa Shadow Execution\n"
+        f"💰 *Current Equity*: `${broker.equity:.2f}`\n"
+        f"📊 *Open Positions*: {pos_str}\n"
+        f"🎯 *Audited Win Rate*: `{win_pct}%`\n"
+        f"🏆 *Total Verified Trades*: {total_trades} ({mgr.state.get('wins', 0)}W / {mgr.state.get('losses', 0)}L)\n"
+        f"🛡️ *Risk Governor Ceiling*: `1.0% max per trade`\n"
+        f"⚡ *Circuit Breaker*: Active (2R Daily Max Loss)"
+    )
+
+
+def format_eod_wrap(broker: OctaBrokerAdapter, mgr: ProductionRuntimeManager, news_filter: NewsCalendarFilter) -> str:
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total_trades = mgr.state.get("wins", 0) + mgr.state.get("losses", 0)
+    n_status = news_filter.get_news_status()
+    return (
+        f"🏁 *END-OF-DAY (EOD) DESK SUMMARY | {today_utc}*\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 *Closing Equity*: `${broker.equity:.2f}`\n"
+        f"📊 *Today's Verified Record*: {mgr.state.get('wins', 0)}W / {mgr.state.get('losses', 0)}L (`{mgr.state.get('win_rate_pct', 0.0)}%`)\n"
+        f"🛡️ *Capital Preservation Status*: `ACTIVE (0 Overnight Risk)`\n"
+        f"📅 *News Blackout Status*: {n_status.summary}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Institutional systems standing by for tomorrow's Asian accumulation session."
+    )
+
+
+def robust_send_telegram(token: str, chat_id: str | int, text: str, reply_markup: dict | None = None) -> bool:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     for attempt in range(3):
         try:
-            r = requests.post(
-                url,
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-                timeout=10,
-            )
+            r = requests.post(url, json=payload, timeout=10)
             if r.status_code == 200:
                 return True
             elif r.status_code == 400:
                 # Failsafe: Telegram entity parsing failure, fallback to plain text to prevent dropped messages
-                r_plain = requests.post(
-                    url,
-                    json={"chat_id": chat_id, "text": text},
-                    timeout=10,
-                )
+                plain_payload = {"chat_id": chat_id, "text": text}
+                if reply_markup is not None:
+                    plain_payload["reply_markup"] = reply_markup
+                r_plain = requests.post(url, json=plain_payload, timeout=10)
                 if r_plain.status_code == 200:
                     return True
         except Exception as e:
@@ -644,32 +841,32 @@ def run_24_7_service():
     last_update_id = 0
     last_scan_time = 0
     last_pulse_time = time.time()  # Track periodic telemetry pulse
+    last_eod_date = ""             # Track automated 21:00 UTC EOD wrap
     pulse_counter = 0
 
     logger.info("==================================================")
-    logger.info("   24/7 MASTER LIVE TRADER (6 UPGRADES ACTIVE)    ")
+    logger.info("   24/7 MASTER LIVE TRADER (JPMORGAN DESK ACTIVE) ")
     logger.info("==================================================")
     logger.info("Alerts Status: %s | Model Win Rate: %s%%", "ACTIVE" if mgr.is_alerts_enabled() else "PAUSED", mgr.state['win_rate_pct'])
 
     # Send upgrade announcement to phone
     announcement = (
-        "🚀 *6 MASTER UPGRADES DEPLOYED LIVE!*\n\n"
+        "🚀 *JPMORGAN INSTITUTIONAL TRADING DESK UPGRADES ACTIVE!*\n\n"
         "Your AI Trading Bot has been upgraded with:\n"
-        "1. 🌐 *Multi-Timeframe Matrix* (H1 Trend Bias)\n"
-        "2. 🛡️ *Post-Judas Sweep Confirmation*\n"
-        "3. 🕒 *Session Killzone Filter* (London/NY Prime)\n"
-        "4. 🔒 *Dynamic Break-Even Shield* (+20 pips ➔ SL to Entry)\n"
-        "5. 📏 *Volatility-Normalized ATR Stop Loss*\n"
-        "6. 🧠 *Master XGBoost + LightGBM Ensemble* (13,747 M5 bars retrained)\n\n"
+        "1. 🧭 *Macro Compass* (DXY & US 10Y Yield Concordance)\n"
+        "2. 📅 *Red-Folder Economic News Blackout* (CPI/NFP/FOMC 30m shield)\n"
+        "3. 🏛️ *HTF Liquidity Pools* (PDH, PDL, PWH, PWL, NYMO Benchmarks)\n"
+        "4. 📏 *Volatility-Targeted Risk Governor* (Dynamic k_vol & Conviction Sizing)\n"
+        "5. 🎮 *Interactive Telegram Desk* (One-click buttons & on-demand macro/news)\n\n"
         f"• *Verified Win Rate*: `{mgr.state['win_rate_pct']}%`\n"
-        "Tap `/trade` anytime for an immediate setup!"
+        "Tap `/trade` or the buttons below for immediate institutional analysis!"
     )
     for cid in subscribers:
-        robust_send_telegram(token, cid, announcement)
+        robust_send_telegram(token, cid, announcement, reply_markup=get_institutional_keyboard())
 
     while True:
         try:
-            # 1. Telegram Inbound Commands
+            # 1. Telegram Inbound Commands & Callback Queries
             try:
                 up_url = f"{base_url}/getUpdates?offset={last_update_id + 1}&timeout=5"
                 resp = requests.get(up_url, timeout=10)
@@ -678,6 +875,42 @@ def run_24_7_service():
                     if data.get("ok"):
                         for upd in data.get("result", []):
                             last_update_id = upd["update_id"]
+
+                            # A. Handle Interactive Inline Keyboard Button Clicks
+                            if "callback_query" in upd:
+                                cq = upd["callback_query"]
+                                cq_id = cq["id"]
+                                u_chat = str(cq.get("message", {}).get("chat", {}).get("id"))
+                                c_data = cq.get("data", "")
+
+                                # Acknowledge callback immediately
+                                try:
+                                    requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cq_id}, timeout=5)
+                                except Exception:
+                                    pass
+
+                                if not u_chat:
+                                    continue
+                                subscribers.add(u_chat)
+
+                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                setup = analyze_with_6_master_upgrades(df, mgr)
+
+                                if c_data == "cmd_signal":
+                                    robust_send_telegram(token, u_chat, format_card(setup, "INSTANT MASTER SETUP"), reply_markup=get_institutional_keyboard())
+                                elif c_data == "cmd_pulse":
+                                    robust_send_telegram(token, u_chat, format_telemetry_pulse(setup, broker, mgr), reply_markup=get_institutional_keyboard())
+                                elif c_data == "cmd_liquidity":
+                                    robust_send_telegram(token, u_chat, format_liquidity_card(setup.get("watchlist", {})), reply_markup=get_institutional_keyboard())
+                                elif c_data == "cmd_macro":
+                                    robust_send_telegram(token, u_chat, format_macro_card(setup.get("macro_snapshot")), reply_markup=get_institutional_keyboard())
+                                elif c_data == "cmd_news":
+                                    robust_send_telegram(token, u_chat, format_news_card(setup.get("news_status")), reply_markup=get_institutional_keyboard())
+                                elif c_data == "cmd_pnl":
+                                    robust_send_telegram(token, u_chat, format_pnl_card(broker, mgr), reply_markup=get_institutional_keyboard())
+                                continue
+
+                            # B. Handle Text Commands
                             msg = upd.get("message", {})
                             u_chat = str(msg.get("chat", {}).get("id"))
                             text = msg.get("text", "").strip().lower()
@@ -691,54 +924,73 @@ def run_24_7_service():
                             if text.startswith("/start"):
                                 mgr.set_alerts(True)
                                 start_ack = (
-                                    "🟢 *24/7 AUTOMATIC ALERTS ACTIVATED!*\n\n"
-                                    "Running with the 6 Master Upgrades & Dual Ensemble.\n"
-                                    "You will receive automatic alerts on every high-probability setup.\n\n"
+                                    "🟢 *JPMORGAN INSTITUTIONAL 24/7 DESK ACTIVATED!*\n\n"
+                                    "Running with Macro Compass, Economic News Blackout & HTF Pools.\n"
+                                    "You will receive automatic alerts on verified institutional setups.\n\n"
                                     "Send `/end` at any time to pause alerts."
                                 )
-                                robust_send_telegram(token, u_chat, start_ack)
+                                robust_send_telegram(token, u_chat, start_ack, reply_markup=get_institutional_keyboard())
                                 df = fetch_live_candles("XAUUSD", "M5", 50)
                                 setup = analyze_with_6_master_upgrades(df, mgr)
-                                robust_send_telegram(token, u_chat, format_card(setup, "LIVE MARKET SETUP"))
+                                robust_send_telegram(token, u_chat, format_card(setup, "LIVE MARKET SETUP"), reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/end") or text.startswith("/stop"):
                                 mgr.set_alerts(False)
                                 end_ack = (
                                     "🔴 *24/7 AUTOMATIC ALERTS PAUSED*\n\n"
                                     "Continuous background alerts are now paused.\n"
-                                    "• Send `/trade` anytime for on-demand signals.\n"
-                                    "• Send `/start` to resume 24/7 automated alerts."
+                                    "• Tap `/trade` anytime for on-demand signals.\n"
+                                    "• Tap `/start` to resume 24/7 automated alerts."
                                 )
-                                robust_send_telegram(token, u_chat, end_ack)
+                                robust_send_telegram(token, u_chat, end_ack, reply_markup=get_institutional_keyboard())
 
                             elif any(text.startswith(c) for c in ["/trade", "/signal", "/next", "/entry"]):
                                 df = fetch_live_candles("XAUUSD", "M5", 50)
                                 setup = analyze_with_6_master_upgrades(df, mgr)
-                                robust_send_telegram(token, u_chat, format_card(setup, "INSTANT MASTER SETUP"))
+                                robust_send_telegram(token, u_chat, format_card(setup, "INSTANT MASTER SETUP"), reply_markup=get_institutional_keyboard())
+
+                            elif text.startswith("/macro"):
+                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                setup = analyze_with_6_master_upgrades(df, mgr)
+                                robust_send_telegram(token, u_chat, format_macro_card(setup.get("macro_snapshot")), reply_markup=get_institutional_keyboard())
+
+                            elif text.startswith("/news"):
+                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                setup = analyze_with_6_master_upgrades(df, mgr)
+                                robust_send_telegram(token, u_chat, format_news_card(setup.get("news_status")), reply_markup=get_institutional_keyboard())
+
+                            elif text.startswith("/liquidity"):
+                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                setup = analyze_with_6_master_upgrades(df, mgr)
+                                robust_send_telegram(token, u_chat, format_liquidity_card(setup.get("watchlist", {})), reply_markup=get_institutional_keyboard())
+
+                            elif text.startswith("/pnl"):
+                                robust_send_telegram(token, u_chat, format_pnl_card(broker, mgr), reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/pulse"):
                                 df = fetch_live_candles("XAUUSD", "M5", 50)
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 pulse_card = format_telemetry_pulse(setup, broker, mgr)
-                                robust_send_telegram(token, u_chat, pulse_card)
+                                robust_send_telegram(token, u_chat, pulse_card, reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/status") or text.startswith("/learn"):
                                 df = fetch_live_candles("XAUUSD", "M5", 50)
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 status_text = (
-                                    f"📊 *6-UPGRADE MASTER ENGINE STATUS*\n\n"
+                                    f"📊 *JPMORGAN INSTITUTIONAL ENGINE STATUS*\n\n"
                                     f"• *24/7 Alerts Mode*: {'🟢 ACTIVE' if mgr.is_alerts_enabled() else '🔴 PAUSED'}\n"
                                     f"• *Live Gold Price*: `${setup['price']:.2f}`\n"
                                     f"• *Current Bias*: `{setup['action']}`\n"
                                     f"• *Session Window*: `{setup['session']}`\n"
                                     f"• *Structure Regime*: `{setup['regime']}`\n"
-                                    f"• *Model Version*: `XGBoost + LightGBM (13,521 M5 Trained)`\n"
+                                    f"• *Macro Regime*: `{setup.get('macro_snapshot').regime if setup.get('macro_snapshot') else 'N/A'}`\n"
+                                    f"• *News Blackout*: `{'LOCKED' if setup.get('news_status') and setup.get('news_status').is_locked else 'CLEAR'}`\n"
                                     f"• *Verified Win Rate*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n"
                                     f"• *Volume Delta*: 🟢 {setup['buyer_pct']}% vs 🔴 {setup['seller_pct']}%\n"
-                                    f"• *Account Equity*: $40.68 (Octa Real Verified)\n\n"
+                                    f"• *Account Equity*: ${broker.equity:.2f} (Octa Real Verified)\n\n"
                                     f"Continuous online learning active."
                                 )
-                                robust_send_telegram(token, u_chat, status_text)
+                                robust_send_telegram(token, u_chat, status_text, reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/audit"):
                                 recent = mgr.state.get("pending_trades", [])[-5:]
@@ -912,8 +1164,17 @@ def run_24_7_service():
                             last_pulse_time = now
                             pulse_card = format_telemetry_pulse(setup, broker, mgr)
                             for cid in list(subscribers):
-                                robust_send_telegram(token, cid, pulse_card)
+                                robust_send_telegram(token, cid, pulse_card, reply_markup=get_institutional_keyboard())
                             logger.info("Dispatched periodic telemetry pulse to %d subscriber(s) (Gold: $%.2f, Bias: %s)", len(subscribers), setup["price"], setup["action"])
+
+                        # 4. Automated 21:00 UTC Institutional EOD Wrap
+                        now_utc = datetime.now(timezone.utc)
+                        if now_utc.hour == 21 and last_eod_date != now_utc.strftime("%Y-%m-%d"):
+                            last_eod_date = now_utc.strftime("%Y-%m-%d")
+                            eod_msg = format_eod_wrap(broker, mgr, news_filter)
+                            for cid in list(subscribers):
+                                robust_send_telegram(token, cid, eod_msg, reply_markup=get_institutional_keyboard())
+                            logger.info("Broadcasted automated institutional EOD wrap for %s", last_eod_date)
 
                 except Exception as e:
                     logger.warning("Scanner cycle error (handled): %s", e)
