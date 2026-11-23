@@ -174,8 +174,10 @@ def _positive_probability(model, X: pd.DataFrame) -> np.ndarray:
     probabilities = model.predict_proba(X)
     if probabilities.shape[1] == 1:
         return np.zeros(len(X)) if model.classes_[0] == 0 else np.ones(len(X))
-    positive_index = list(model.classes_).index(1)
-    return probabilities[:, positive_index]
+    if 1 in model.classes_:
+        positive_index = list(model.classes_).index(1)
+        return probabilities[:, positive_index]
+    return np.zeros(len(X))
 
 
 def _pattern_agreement(df: pd.DataFrame, side: str) -> np.ndarray:
