@@ -579,18 +579,38 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
                 pred_icon = "🟢"
                 pred_action = "BUY (Long Reversal on SSL Sweep)"
                 pred_entry = target_pool["price"]
-                pred_sl = round(target_pool["price"] - max(2.5, atr_est * 1.2), 2)
-                pred_tp1 = round(vwap_val if (vwap_val and vwap_val > pred_entry) else (pred_entry + 1.5 * abs(pred_entry - pred_sl)), 2)
-                pred_tp2 = round(nearest_bsl["price"] if nearest_bsl else (pred_entry + 3.0 * abs(pred_entry - pred_sl)), 2)
-                pred_trigger = f"${target_pool.get('sweep_max_trigger', pred_entry - 2.0):.2f} – ${target_pool.get('sweep_min_trigger', pred_entry):.2f}"
+                sweep_max_dip = float(target_pool.get("sweep_max_trigger", pred_entry - (1.5 * atr_est)))
+                # Stop loss strictly beyond the maximum sweep wick
+                pred_sl = round(min(sweep_max_dip - 1.0, pred_entry - (1.8 * atr_est)), 2)
+                r_dist = abs(pred_entry - pred_sl)
+                # For BUY: Entry < TP1 < TP2
+                tp1_candidate = round(vwap_val, 2) if (vwap_val and vwap_val > (pred_entry + 0.8 * r_dist)) else round(pred_entry + 1.5 * r_dist, 2)
+                bsl_target = nearest_bsl["price"] if nearest_bsl else None
+                if bsl_target and bsl_target > tp1_candidate:
+                    tp2_candidate = round(bsl_target, 2)
+                else:
+                    tp2_candidate = round(max(tp1_candidate + 1.5 * r_dist, pred_entry + 3.0 * r_dist), 2)
+                pred_tp1 = tp1_candidate
+                pred_tp2 = tp2_candidate
+                pred_trigger = f"${min(sweep_max_dip, pred_entry):.2f} – ${max(sweep_max_dip, pred_entry):.2f}"
             else:
                 pred_icon = "🔴"
                 pred_action = "SELL (Short Reversal on BSL Sweep)"
                 pred_entry = target_pool["price"]
-                pred_sl = round(target_pool["price"] + max(2.5, atr_est * 1.2), 2)
-                pred_tp1 = round(vwap_val if (vwap_val and vwap_val < pred_entry) else (pred_entry - 1.5 * abs(pred_sl - pred_entry)), 2)
-                pred_tp2 = round(nearest_ssl["price"] if nearest_ssl else (pred_entry - 3.0 * abs(pred_sl - pred_entry)), 2)
-                pred_trigger = f"${target_pool.get('sweep_min_trigger', pred_entry):.2f} – ${target_pool.get('sweep_max_trigger', pred_entry + 2.0):.2f}"
+                sweep_max_reach = float(target_pool.get("sweep_max_trigger", pred_entry + (1.5 * atr_est)))
+                # Stop loss strictly beyond the maximum sweep wick
+                pred_sl = round(max(sweep_max_reach + 1.0, pred_entry + (1.8 * atr_est)), 2)
+                r_dist = abs(pred_sl - pred_entry)
+                # For SELL: Entry > TP1 > TP2
+                tp1_candidate = round(vwap_val, 2) if (vwap_val and vwap_val < (pred_entry - 0.8 * r_dist)) else round(pred_entry - 1.5 * r_dist, 2)
+                ssl_target = nearest_ssl["price"] if nearest_ssl else None
+                if ssl_target and ssl_target < tp1_candidate:
+                    tp2_candidate = round(ssl_target, 2)
+                else:
+                    tp2_candidate = round(min(tp1_candidate - 1.5 * r_dist, pred_entry - 3.0 * r_dist), 2)
+                pred_tp1 = tp1_candidate
+                pred_tp2 = tp2_candidate
+                pred_trigger = f"${min(pred_entry, sweep_max_reach):.2f} – ${max(pred_entry, sweep_max_reach):.2f}"
 
             pred_eta = target_pool.get("eta_display", "APPROACHING")
             pred_tier_tag = f"[{target_pool.get('tier', 'TIER_1_INSTITUTIONAL')}]"
@@ -599,9 +619,9 @@ def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str
                 f"• 🎯 *Target Pool*: `{target_pool['level_id']}` (`{target_pool['level_type']}`) {pred_tier_tag} at `${target_pool['price']:.2f}`\n"
                 f"• ⚡ *Predicted Signal*: {pred_icon} *{pred_action}*\n"
                 f"• 📍 *Predicted Entry Zone*: `{pred_trigger}`\n"
-                f"• 🛑 *Predicted Stop Loss (SL)*: `${pred_sl:.2f}` (Beyond sweep wick)\n"
+                f"• 🛑 *Predicted Stop Loss (SL)*: `${pred_sl:.2f}` (Beyond sweep wick reach)\n"
                 f"• 🏁 *Predicted Take Profit 1 (TP1)*: `${pred_tp1:.2f}` (Session VWAP Fair Value)\n"
-                f"• 🚀 *Predicted Take Profit 2 (TP2)*: `${pred_tp2:.2f}` (Opposite Liquidity Pool)\n"
+                f"• 🚀 *Predicted Take Profit 2 (TP2)*: `${pred_tp2:.2f}` (Opposite Liquidity Pool Runner)\n"
                 f"• ⏳ *Estimated Sweep Arrival*: `{pred_eta}`\n"
                 f"• 🛡️ *Order Readiness*: `ARMED — Ready to fire on confirmed sweep rejection`\n\n"
             )

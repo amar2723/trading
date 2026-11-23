@@ -688,6 +688,9 @@ class LiquidityMap:
         bsl_list = []
         ssl_list = []
 
+        BSL_TYPES = {"SESSION_HIGH", "PDH", "PWH", "VP_VAH"}
+        SSL_TYPES = {"SESSION_LOW", "PDL", "PWL", "VP_VAL", "NYMO"}
+
         for lvl in levels:
             dist_usd = round(abs(lvl.price - current_price), 2)
             dist_pips = round(dist_usd * 10.0, 1)
@@ -718,8 +721,8 @@ class LiquidityMap:
                 "distance_usd": dist_usd,
                 "distance_pips": dist_pips,
                 "evidence": lvl.evidence,
-                "sweep_min_trigger": round(lvl.price + (self.min_sweep_atr_mult * atr_val) if lvl.price > current_price else lvl.price - (self.min_sweep_atr_mult * atr_val), 2),
-                "sweep_max_trigger": round(lvl.price + (self.max_sweep_atr_mult * atr_val) if lvl.price > current_price else lvl.price - (self.max_sweep_atr_mult * atr_val), 2),
+                "sweep_min_trigger": round(lvl.price + (self.min_sweep_atr_mult * atr_val) if lvl.price >= current_price else lvl.price - (self.min_sweep_atr_mult * atr_val), 2),
+                "sweep_max_trigger": round(lvl.price + (self.max_sweep_atr_mult * atr_val) if lvl.price >= current_price else lvl.price - (self.max_sweep_atr_mult * atr_val), 2),
                 "timing_status": timing_status,
                 "eta_minutes": est_minutes,
                 "eta_display": timing_eta,
@@ -727,9 +730,17 @@ class LiquidityMap:
                 "est_arrival_utc": est_time_utc.strftime("%H:%M UTC"),
             }
 
-            if lvl.price > current_price:
+            # Categorize structurally:
+            # 1. BSL: Overhead resting buy stops above highs (never low/support levels)
+            if lvl.price >= current_price and lvl.level_type in BSL_TYPES:
                 bsl_list.append(pool_entry)
-            elif lvl.price < current_price:
+            # 2. SSL: Underlying resting sell stops below lows (never high/resistance levels)
+            elif lvl.price <= current_price and lvl.level_type in SSL_TYPES:
+                ssl_list.append(pool_entry)
+            # 3. Fallback for untyped levels
+            elif lvl.price > current_price and lvl.level_type not in SSL_TYPES:
+                bsl_list.append(pool_entry)
+            elif lvl.price < current_price and lvl.level_type not in BSL_TYPES:
                 ssl_list.append(pool_entry)
 
         # Sort BSL closest first (lowest price above current)
