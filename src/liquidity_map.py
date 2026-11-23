@@ -634,7 +634,7 @@ class LiquidityMap:
         if df is None or len(df) < 5:
             return {}
 
-        current_price = float(df["close"].iloc[-1])
+        current_price = float(df.attrs.get("regular_market_price", df["close"].iloc[-1]))
         levels = self.compute_session_levels(df, df_h1=df_h1)
         vwap_dict = self.compute_anchored_vwap(df)
         vp_dict = self.compute_volume_profile(df)
@@ -660,7 +660,10 @@ class LiquidityMap:
             ))
 
         # Timing & Institutional Killzone Schedule
-        ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True)
+        if df.attrs.get("regular_market_time"):
+            ts = pd.to_datetime(df.attrs["regular_market_time"], unit="s", utc=True)
+        else:
+            ts = pd.to_datetime(df["timestamp"].iloc[-1], utc=True)
         ts_ist = ts + pd.Timedelta(hours=5, minutes=30)
         curr_hour = ts.hour
 

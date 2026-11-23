@@ -243,20 +243,38 @@ class ProductionRuntimeManager:
         return updated
 
 
+_H1_CACHE: dict = {"timestamp": 0.0, "df": None, "source": "", "spot": False}
+
+
 def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManager) -> dict:
+    global _H1_CACHE
     timestamps = pd.to_datetime(df["timestamp"])
     last_ts = timestamps.iloc[-1]
     curr_hour = last_ts.hour
 
-    # Upgrade 1: True Causal Higher-Timeframe (H1) Trend from completed bars
+    # Upgrade 1: True Causal Higher-Timeframe (H1) Trend from completed bars (Cached for 60s to ensure instant sub-second response)
     m5_is_broker_spot = bool(df["is_broker_spot"].iloc[-1]) if "is_broker_spot" in df.columns else False
     m5_source = str(df["data_source"].iloc[-1]) if "data_source" in df.columns else "UNKNOWN"
 
     df_h1 = None
-    try:
-        df_h1 = fetch_live_candles("XAUUSD", "H1", 50, require_broker_spot=m5_is_broker_spot)
-    except Exception as e:
-        logger.warning("H1 causal fetch note: %s", e)
+    now_mono = time.time()
+    if (
+        _H1_CACHE["df"] is not None
+        and (now_mono - _H1_CACHE["timestamp"]) < 60.0
+        and _H1_CACHE["source"] == m5_source
+        and _H1_CACHE["spot"] == m5_is_broker_spot
+    ):
+        df_h1 = _H1_CACHE["df"]
+    else:
+        try:
+            df_h1 = fetch_live_candles("XAUUSD", "H1", 50, require_broker_spot=m5_is_broker_spot)
+            if df_h1 is not None and not df_h1.empty:
+                _H1_CACHE["df"] = df_h1
+                _H1_CACHE["timestamp"] = now_mono
+                _H1_CACHE["source"] = m5_source
+                _H1_CACHE["spot"] = m5_is_broker_spot
+        except Exception as e:
+            logger.warning("H1 causal fetch note: %s", e)
 
     h1_source = str(df_h1["data_source"].iloc[-1]) if (df_h1 is not None and not df_h1.empty and "data_source" in df_h1.columns) else "UNAVAILABLE"
     h1_is_broker_spot = bool(df_h1["is_broker_spot"].iloc[-1]) if (df_h1 is not None and not df_h1.empty and "is_broker_spot" in df_h1.columns) else False
@@ -278,7 +296,8 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
     df_proc = compute_indicator_dataframe(df, df_h1=df_h1)
     last_row = df_proc.iloc[-1]
 
-    current_price = float(last_row["close"])
+    # Real-time tick price takes precedence over completed bar close
+    current_price = float(df.attrs.get("regular_market_price", last_row["close"]))
     h1_trend_bias = int(last_row["h1_trend_bias"])
     h1_dist_ema50 = float(last_row["h1_dist_ema50"])
     ema_20 = float(last_row["ema_20"])
@@ -846,6 +865,21 @@ def robust_send_telegram(token: str, chat_id: str | int, text: str, reply_markup
     return False
 
 
+_M5_USER_CACHE: dict = {"timestamp": 0.0, "df": None}
+
+
+def get_fast_m5() -> pd.DataFrame:
+    global _M5_USER_CACHE
+    now_m5 = time.time()
+    if _M5_USER_CACHE["df"] is not None and (now_m5 - _M5_USER_CACHE["timestamp"]) < 5.0:
+        return _M5_USER_CACHE["df"]
+    fresh_df = fetch_live_candles("XAUUSD", "M5", 50)
+    if fresh_df is not None and not fresh_df.empty:
+        _M5_USER_CACHE["df"] = fresh_df
+        _M5_USER_CACHE["timestamp"] = now_m5
+    return fresh_df if (fresh_df is not None and not fresh_df.empty) else _M5_USER_CACHE.get("df")
+
+
 def run_24_7_service():
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
     primary_chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
@@ -888,8 +922,8 @@ def run_24_7_service():
         try:
             # 1. Telegram Inbound Commands & Callback Queries
             try:
-                up_url = f"{base_url}/getUpdates?offset={last_update_id + 1}&timeout=5"
-                resp = requests.get(up_url, timeout=10)
+                up_url = f"{base_url}/getUpdates?offset={last_update_id + 1}&timeout=1"
+                resp = requests.get(up_url, timeout=5)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("ok"):
@@ -903,9 +937,9 @@ def run_24_7_service():
                                 u_chat = str(cq.get("message", {}).get("chat", {}).get("id"))
                                 c_data = cq.get("data", "")
 
-                                # Acknowledge callback immediately
+                                # Acknowledge callback immediately for instant UI response
                                 try:
-                                    requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cq_id}, timeout=5)
+                                    requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cq_id, "cache_time": 1}, timeout=2)
                                 except Exception:
                                     pass
 
@@ -913,7 +947,7 @@ def run_24_7_service():
                                     continue
                                 subscribers.add(u_chat)
 
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
 
                                 if c_data == "cmd_signal":
@@ -950,7 +984,7 @@ def run_24_7_service():
                                     "Send `/end` at any time to pause alerts."
                                 )
                                 robust_send_telegram(token, u_chat, start_ack, reply_markup=get_institutional_keyboard())
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 robust_send_telegram(token, u_chat, format_card(setup, "LIVE MARKET SETUP"), reply_markup=get_institutional_keyboard())
 
@@ -965,22 +999,22 @@ def run_24_7_service():
                                 robust_send_telegram(token, u_chat, end_ack, reply_markup=get_institutional_keyboard())
 
                             elif any(text.startswith(c) for c in ["/trade", "/signal", "/next", "/entry"]):
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 robust_send_telegram(token, u_chat, format_card(setup, "INSTANT MASTER SETUP"), reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/macro"):
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 robust_send_telegram(token, u_chat, format_macro_card(setup.get("macro_snapshot")), reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/news"):
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 robust_send_telegram(token, u_chat, format_news_card(setup.get("news_status")), reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/liquidity"):
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 robust_send_telegram(token, u_chat, format_liquidity_card(setup.get("watchlist", {})), reply_markup=get_institutional_keyboard())
 
@@ -988,13 +1022,13 @@ def run_24_7_service():
                                 robust_send_telegram(token, u_chat, format_pnl_card(broker, mgr), reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/pulse"):
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 pulse_card = format_telemetry_pulse(setup, broker, mgr)
                                 robust_send_telegram(token, u_chat, pulse_card, reply_markup=get_institutional_keyboard())
 
                             elif text.startswith("/status") or text.startswith("/learn"):
-                                df = fetch_live_candles("XAUUSD", "M5", 50)
+                                df = get_fast_m5()
                                 setup = analyze_with_6_master_upgrades(df, mgr)
                                 status_text = (
                                     f"📊 *JPMORGAN INSTITUTIONAL ENGINE STATUS*\n\n"
@@ -1081,7 +1115,7 @@ def run_24_7_service():
                     last_row = df.iloc[-1]
                     # Canonical 5-minute bar time (floored to clean 5min boundary)
                     candle_bar_time = pd.to_datetime(last_row["timestamp"]).floor("5min").strftime("%Y-%m-%d %H:%M:00")
-                    current_close = float(last_row["close"])
+                    current_close = float(df.attrs.get("regular_market_price", last_row["close"]))
 
                     # 1. Evaluate Octa Broker Tick Events (Fills, BE, TP, SL)
                     broker_events = broker.on_tick(
@@ -1106,16 +1140,8 @@ def run_24_7_service():
                     )
                     if update_note:
                         logger.info("Master Learner Audit Event: %s", update_note)
-                        res_msg = (
-                            f"🔔 *TRADE AUDIT RESOLUTION*\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"{update_note}\n\n"
-                            f"• *Current Gold*: `${current_close:.2f}`\n"
-                            f"• *Verified Record*: `{mgr.state['win_rate_pct']}%` ({mgr.state['wins']}W / {mgr.state['losses']}L)\n"
-                            f"📁 Logged to `reports/live_predictions_audit.jsonl` for retraining."
-                        )
-                        for cid in list(subscribers):
-                            robust_send_telegram(token, cid, res_msg)
+                        # Recorded silently in durable state and reports/live_predictions_audit.jsonl
+                        # Available to users on-demand via the /audit command to prevent chat spam
 
                     if mgr.is_alerts_enabled():
                         setup = analyze_with_6_master_upgrades(df, mgr)
@@ -1142,12 +1168,12 @@ def run_24_7_service():
                                 bar_timestamp=candle_bar_time,
                             )
 
-                            # 2. Gating: ONLY dispatch to Telegram & broker execute if BOTH ML filter and Risk Governor approve AND action != HOLD!
+                            # 2. Gating: Actionable execution if approved, otherwise forward-looking predictive forecast
                             is_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE" and setup["action"] != "HOLD"
                             if is_actionable:
-                                card = format_card(setup, "24/7 MASTER AI SIGNAL")
+                                card = format_card(setup, "⚡ 24/7 MASTER AI SIGNAL")
                                 for cid in list(subscribers):
-                                    robust_send_telegram(token, cid, card)
+                                    robust_send_telegram(token, cid, card, reply_markup=get_institutional_keyboard())
                                 mgr.record_prediction(
                                     action=setup["action"],
                                     entry=setup["entry"],
@@ -1172,8 +1198,11 @@ def run_24_7_service():
                                         logger.info("Octa Shadow Demo executed order %s (%s %.2f lots @ %.2f)", executed_pos.ticket, setup["action"], executed_pos.lots, executed_pos.open_price)
                                 logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%, E[R]: +%.2fR)", setup["action"], sig_id, setup["price"], setup["confidence"], setup.get("ml_expected_R", 0.0))
                             else:
-                                veto_reason = setup.get("risk_veto") or f"ML E[R] ({setup.get('ml_expected_R', 0.0):+.2f}R) below hurdle (+0.15R)"
-                                logger.info("Bar %s Filtered: ML=%s, Risk=%s. [Decision: HOLD]", candle_bar_time, setup.get("ml_decision"), veto_reason)
+                                # Continuous Institutional Predictive Setup Forecast (Upcoming Liquidity Sweep Target)
+                                card = format_card(setup, "🔮 INSTITUTIONAL PREDICTIVE FORECAST")
+                                for cid in list(subscribers):
+                                    robust_send_telegram(token, cid, card, reply_markup=get_institutional_keyboard())
+                                logger.info("Dispatched forward-looking predictive forecast for %s to %d subscriber(s)", candle_bar_time, len(subscribers))
 
                             mgr.state["last_alerted_candle"] = candle_bar_time
                             mgr.save_state()

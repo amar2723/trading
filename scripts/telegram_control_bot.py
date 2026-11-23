@@ -35,6 +35,7 @@ from scripts.autonomous_live_trader import (
     format_pnl_card,
     format_telemetry_pulse,
     get_institutional_keyboard,
+    get_fast_m5,
     broker,
 )
 
@@ -56,10 +57,10 @@ def run_telegram_vip_bot():
 
     while True:
         try:
-            url = f"{base_url}/getUpdates?offset={last_update_id + 1}&timeout=10"
-            resp = requests.get(url, timeout=15).json()
+            url = f"{base_url}/getUpdates?offset={last_update_id + 1}&timeout=1"
+            resp = requests.get(url, timeout=5).json()
             if not resp.get("ok"):
-                time.sleep(2)
+                time.sleep(1)
                 continue
 
             for update in resp.get("result", []):
@@ -73,14 +74,14 @@ def run_telegram_vip_bot():
                     c_data = cq.get("data", "")
 
                     try:
-                        requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cq_id}, timeout=5)
+                        requests.post(f"{base_url}/answerCallbackQuery", json={"callback_query_id": cq_id, "cache_time": 1}, timeout=2)
                     except Exception:
                         pass
 
                     if not chat_id:
                         continue
 
-                    df = fetch_live_candles("XAUUSD", "M5", 50)
+                    df = get_fast_m5()
                     setup = analyze_with_6_master_upgrades(df, mgr)
 
                     if c_data == "cmd_signal":
@@ -106,7 +107,7 @@ def run_telegram_vip_bot():
                     continue
 
                 cmd = text.lower()
-                df = fetch_live_candles("XAUUSD", "M5", 50)
+                df = get_fast_m5()
                 setup = analyze_with_6_master_upgrades(df, mgr)
 
                 if cmd.startswith("/start"):
