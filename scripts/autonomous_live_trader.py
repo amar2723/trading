@@ -248,6 +248,42 @@ _H1_CACHE: dict = {"timestamp": 0.0, "df": None, "source": "", "spot": False}
 
 def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManager) -> dict:
     global _H1_CACHE
+    if df is None or df.empty or len(df) < 5 or "timestamp" not in df.columns:
+        return {
+            "price": 0.0,
+            "action": "HOLD",
+            "strategy": "FEED_RECOVERY_HOLD",
+            "entry": 0.0,
+            "sl": 0.0,
+            "tp1": 0.0,
+            "tp2": 0.0,
+            "be_trigger": 0.0,
+            "risk_reward": "N/A",
+            "lot_size": 0.0,
+            "risk_usd": 0.0,
+            "risk_pips": 0.0,
+            "ml_decision": "ABSTAIN",
+            "ml_expected_R": 0.0,
+            "ml_win_prob": 0.50,
+            "risk_approved": False,
+            "risk_veto": "DATA_FEED_OFFLINE",
+            "k_vol": 1.0,
+            "effective_risk_pct": 0.0,
+            "buyer_pct": 50.0,
+            "seller_pct": 50.0,
+            "session": "STANDBY",
+            "regime": "DATA_UNAVAILABLE",
+            "confidence": 0.0,
+            "win_rate": mgr.state.get("win_rate_pct", 0.0),
+            "win_count": mgr.state.get("wins", 0),
+            "loss_count": mgr.state.get("losses", 0),
+            "rsi": 50.0,
+            "why": "• Live market candle feed temporarily reconnecting. Capital preserved safely.",
+            "macro_snapshot": None,
+            "news_status": None,
+            "watchlist": {},
+        }
+
     timestamps = pd.to_datetime(df["timestamp"])
     last_ts = timestamps.iloc[-1]
     curr_hour = last_ts.hour
