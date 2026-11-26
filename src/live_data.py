@@ -128,6 +128,7 @@ def validate_candle_dataframe(
 
 
 _WEB_SESSION: requests.Session | None = None
+_SPOT_BAR_CACHE: dict[str, dict[pd.Timestamp, dict]] = {}
 
 
 def get_web_session() -> requests.Session:
@@ -141,16 +142,101 @@ def get_web_session() -> requests.Session:
     return _WEB_SESSION
 
 
+def fetch_live_spot_quote(symbol: str = "XAUUSD") -> dict | None:
+    """
+    Fetch real-time OTC Spot XAUUSD Bid/Ask quote from public institutional feeds.
+    1. Swissquote Public BBO (Live institutional FX Spot Bid/Ask)
+    2. Gold-API Spot XAU/USD fallback
+    """
+    session = get_web_session()
+    try:
+        r = session.get(
+            "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
+            timeout=3,
+        )
+        if r.status_code == 200:
+            payload = r.json()
+            if isinstance(payload, list) and payload:
+                profiles = payload[0].get("spreadProfilePrices") or []
+                if profiles:
+                    p0 = profiles[0]
+                    bid = float(p0["bid"])
+                    ask = float(p0["ask"])
+                    if bid > 1000.0 and ask >= bid:
+                        mid = round((bid + ask) / 2.0, 2)
+                        return {
+                            "bid": round(bid, 2),
+                            "ask": round(ask, 2),
+                            "mid": mid,
+                            "spread_pips": round((ask - bid) * 10.0, 1),
+                            "ts": time.time(),
+                            "source": "SWISSQUOTE_SPOT_XAUUSD",
+                        }
+    except Exception as exc:
+        logger.debug("Swissquote spot fetch note: %s", exc)
+
+    try:
+        r = session.get("https://api.gold-api.com/price/XAU", timeout=3)
+        if r.status_code == 200:
+            data = r.json()
+            price = float(data.get("price", 0.0))
+            if price > 1000.0:
+                return {
+                    "bid": round(price - 0.25, 2),
+                    "ask": round(price + 0.25, 2),
+                    "mid": round(price, 2),
+                    "spread_pips": 5.0,
+                    "ts": time.time(),
+                    "source": "GOLD_API_SPOT_XAUUSD",
+                }
+    except Exception as exc:
+        logger.debug("Gold-API spot fetch note: %s", exc)
+
+    return None
+
+
+def _update_spot_bar_cache(timeframe: str, spot_mid: float, now_utc: datetime) -> None:
+    """Record live spot ticks into rolling closed/forming OHLC bars per timeframe."""
+    tf_key = timeframe.upper()
+    tf_minutes = TIMEFRAME_MINUTES.get(tf_key, 5)
+    bucket_epoch = int(now_utc.timestamp() // (tf_minutes * 60)) * (tf_minutes * 60)
+    bucket_ts = pd.to_datetime(bucket_epoch, unit="s", utc=True).tz_localize(None)
+
+    cache = _SPOT_BAR_CACHE.setdefault(tf_key, {})
+    if bucket_ts not in cache:
+        cache[bucket_ts] = {
+            "timestamp": bucket_ts,
+            "open": spot_mid,
+            "high": spot_mid,
+            "low": spot_mid,
+            "close": spot_mid,
+            "tick_volume": 100.0,
+            "volume": 100.0,
+        }
+    else:
+        bar = cache[bucket_ts]
+        bar["high"] = max(bar["high"], spot_mid)
+        bar["low"] = min(bar["low"], spot_mid)
+        bar["close"] = spot_mid
+        bar["tick_volume"] += 10.0
+        bar["volume"] = bar["tick_volume"]
+
+    # Prune old bars beyond 200 buckets
+    if len(cache) > 200:
+        for old_k in sorted(cache.keys())[:-200]:
+            del cache[old_k]
+
+
 def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: int = 100) -> pd.DataFrame:
     """
-    Fetches gold candles from Yahoo Finance COMEX Futures (GC=F) with sub-second pooling.
-    EXPLICITLY labeled as YAHOO_GC_F_FUTURES_PROXY.
-    Guarantees candle freshness: only truly forming bars are dropped; already-closed bars are preserved.
+    Fetches historical gold structure from Yahoo Finance (GC=F) and anchors it to
+    real-time OTC Spot XAUUSD (Swissquote BBO / Gold-API) so holiday halts or
+    futures delays never stall live predictions.
     """
     interval_map = {"M1": "1m", "M5": "5m", "M15": "15m", "H1": "1h"}
     interval = interval_map.get(timeframe.upper(), "5m")
     range_param = "5d" if interval in ["5m", "15m", "1h"] else "1d"
-    
+
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={range_param}"
     session = get_web_session()
     resp = session.get(url, timeout=5)
@@ -171,9 +257,7 @@ def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: 
     df = df.rename(columns={"volume": "tick_volume"})
     df["volume"] = df["tick_volume"]
 
-    # Candle Freshness Gate:
-    # Drop any forming in-progress bars whose close time is strictly in the future.
-    # A bar has closed if now_utc >= candle_timestamp + tf_delta.
+    # Drop forming in-progress bars whose close time is strictly in the future
     now_utc = datetime.now(timezone.utc)
     tf_minutes = TIMEFRAME_MINUTES.get(timeframe.upper(), 5)
     tf_delta = timedelta(minutes=tf_minutes)
@@ -187,12 +271,58 @@ def fetch_live_candles_web(symbol: str = "XAUUSD", timeframe: str = "M5", bars: 
         else:
             break
 
-    df["data_source"] = "YAHOO_GC_F_FUTURES_PROXY"
-    df["is_broker_spot"] = False
-    df["is_futures_proxy"] = True
-    if meta.get("regularMarketPrice") is not None:
-        df.attrs["regular_market_price"] = float(meta["regularMarketPrice"])
-        df.attrs["regular_market_time"] = meta.get("regularMarketTime")
+    spot = fetch_live_spot_quote(symbol)
+    if spot is not None and not df.empty:
+        spot_mid = spot["mid"]
+        _update_spot_bar_cache(timeframe, spot_mid, now_utc)
+
+        # Rebase futures proxy history onto live Spot XAUUSD price space
+        last_fut_close = float(df["close"].iloc[-1])
+        basis = round(spot_mid - last_fut_close, 2)
+        if abs(basis) > 0.05:
+            for col in ("open", "high", "low", "close"):
+                df[col] = (df[col].astype(float) + basis).round(2)
+
+        # If Yahoo bars are frozen (e.g., COMEX holiday), append closed spot bar(s)
+        last_ts = df["timestamp"].iloc[-1].to_pydatetime().replace(tzinfo=timezone.utc)
+        latest_closed_epoch = (int(now_utc.timestamp() // (tf_minutes * 60)) - 1) * (tf_minutes * 60)
+        latest_closed_ts = pd.to_datetime(latest_closed_epoch, unit="s", utc=True).tz_localize(None)
+        if (now_utc - (last_ts + tf_delta)).total_seconds() > (tf_minutes * 60 * 1.2):
+            spot_cache = _SPOT_BAR_CACHE.get(timeframe.upper(), {})
+            closed_spot_bars = [
+                b for ts_k, b in sorted(spot_cache.items())
+                if ts_k > df["timestamp"].iloc[-1] and ts_k <= latest_closed_ts
+            ]
+            if closed_spot_bars:
+                df = pd.concat([df, pd.DataFrame(closed_spot_bars)], ignore_index=True)
+            else:
+                bridge_bar = pd.DataFrame([{
+                    "timestamp": latest_closed_ts,
+                    "open": spot_mid,
+                    "high": round(max(spot_mid, spot["ask"]), 2),
+                    "low": round(min(spot_mid, spot["bid"]), 2),
+                    "close": spot_mid,
+                    "tick_volume": 100.0,
+                    "volume": 100.0,
+                }])
+                df = pd.concat([df, bridge_bar], ignore_index=True)
+
+        df["data_source"] = "LIVE_WEB_SPOT_XAUUSD"
+        df["is_broker_spot"] = False
+        df["is_futures_proxy"] = False
+        df.attrs["regular_market_price"] = spot_mid
+        df.attrs["regular_market_time"] = spot["ts"]
+        df.attrs["spot_bid"] = spot["bid"]
+        df.attrs["spot_ask"] = spot["ask"]
+        df.attrs["spot_spread_pips"] = spot["spread_pips"]
+        df.attrs["spot_source"] = spot["source"]
+    else:
+        df["data_source"] = "YAHOO_GC_F_FUTURES_PROXY"
+        df["is_broker_spot"] = False
+        df["is_futures_proxy"] = True
+        if meta.get("regularMarketPrice") is not None:
+            df.attrs["regular_market_price"] = float(meta["regularMarketPrice"])
+            df.attrs["regular_market_time"] = meta.get("regularMarketTime")
 
     return df.tail(bars).reset_index(drop=True)
 
@@ -296,6 +426,16 @@ def fetch_live_tick(symbol: str = "XAUUSD") -> SpreadQuote:
                     )
         except Exception as e:
             logger.warning("Live tick MT5 error: %s", e)
+
+    spot = fetch_live_spot_quote(symbol)
+    if spot is not None:
+        return SpreadQuote.from_bid_ask(
+            bid=spot["bid"],
+            ask=spot["ask"],
+            time_str=datetime.now(timezone.utc).isoformat(),
+            is_broker_confirmed=False,
+            quote_source=spot["source"],
+        )
 
     # Synthetic fallback (explicitly marked is_broker_confirmed=False)
     candles = fetch_live_candles(symbol, "M5", 25)

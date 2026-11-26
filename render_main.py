@@ -62,6 +62,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
             "losses": state.get("losses", 0),
             "alerts_enabled": state.get("alerts_enabled", True),
             "last_alerted_candle": state.get("last_alerted_candle"),
+            "spot_feed": "SWISSQUOTE_BBO + GOLD_API + YAHOO_STRUCTURE",
             "host": "Render Cloud Infrastructure",
         }
 

@@ -505,8 +505,66 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         news_status=news_status,
     )
 
+    # Evaluate Predictive Signal for Shadow Demo / Signal-Only Mode on verified web spot feeds
+    # (Live MT5 execution remains strictly blocked unless BROKER_MT5_SPOT is active)
+    predictive_signal = None
+    if not timeframe_mismatch and not news_status.is_locked and chosen_sig is not None and chosen_sig.action != "HOLD":
+        p_risk_dist = chosen_sig.risk_pips / 10.0
+        p_min_exp_R = 0.15
+        if chosen_sig.action == "BUY" and macro_snap.concordance_score <= -0.25:
+            p_min_exp_R = 0.40
+        elif chosen_sig.action == "SELL" and macro_snap.concordance_score >= 0.25:
+            p_min_exp_R = 0.40
+        p_ml = meta_filter.evaluate_candidate(
+            candidate_action=chosen_sig.action,
+            strategy_name=chosen_sig.strategy_name,
+            df_m5=df_proc,
+            h1_trend_bias=h1_trend_bias,
+            h1_dist_ema50=h1_dist_ema50,
+            risk_usd=max(1.0, p_risk_dist * 1.0),
+            min_expected_R=p_min_exp_R,
+        )
+        p_quote = broker.get_symbol_quote(current_price)
+        p_risk = risk_governor.review_trade(
+            equity=broker.equity,
+            risk_pips=chosen_sig.risk_pips,
+            stop_dist_usd=p_risk_dist,
+            spread_price_usd=p_quote.spread_price_usd,
+            current_spread_pips=p_quote.spread_pips,
+            open_positions_count=len(broker.open_positions),
+            session_hour=curr_hour,
+            atr_current=atr_val,
+            conviction_score=p_ml.predicted_win_prob,
+            news_status=news_status,
+        )
+        predictive_signal = {
+            "action": chosen_sig.action,
+            "strategy": chosen_sig.strategy_name,
+            "entry": chosen_sig.entry,
+            "sl": chosen_sig.sl,
+            "tp1": chosen_sig.tp1,
+            "tp2": chosen_sig.tp2,
+            "be_trigger": chosen_sig.be_trigger,
+            "risk_pips": chosen_sig.risk_pips,
+            "rationale": chosen_sig.rationale,
+            "ml_decision": p_ml.decision,
+            "ml_expected_R": p_ml.expected_R,
+            "ml_win_prob": p_ml.predicted_win_prob,
+            "risk_approved": p_risk.approved,
+            "risk_veto": p_risk.veto_reason,
+            "lot_size": p_risk.lot_size,
+            "risk_usd": p_risk.risk_usd,
+            "k_vol": p_risk.k_vol,
+            "effective_risk_pct": p_risk.effective_risk_pct,
+            "is_shadow_only": not (is_broker_spot and data_source == "BROKER_MT5_SPOT"),
+        }
+
     return {
         "price": current_price,
+        "spot_bid": df.attrs.get("spot_bid"),
+        "spot_ask": df.attrs.get("spot_ask"),
+        "spot_spread_pips": df.attrs.get("spot_spread_pips"),
+        "data_source": data_source,
         "action": action,
         "strategy": active_strategy,
         "entry": entry,
@@ -540,10 +598,45 @@ def analyze_with_6_master_upgrades(df: pd.DataFrame, mgr: ProductionRuntimeManag
         "macro_snapshot": macro_snap,
         "news_status": news_status,
         "htf_levels": watchlist.get("htf_levels", {}),
+        "predictive_signal": predictive_signal,
     }
 
 
 def format_card(setup: dict, title_prefix: str = "24/7 MASTER AI SIGNAL") -> str:
+    # Promote validated predictive signal (Shadow Demo / Signal-Only) for Telegram display
+    ps = setup.get("predictive_signal")
+    if (
+        setup.get("action") == "HOLD"
+        and ps
+        and ps.get("action") in ("BUY", "SELL")
+        and ps.get("ml_decision") == "TAKE"
+        and ps.get("risk_approved")
+    ):
+        setup = {
+            **setup,
+            "action": ps["action"],
+            "strategy": f"{ps['strategy']} (SHADOW_SIGNAL)",
+            "entry": ps["entry"],
+            "sl": ps["sl"],
+            "tp1": ps["tp1"],
+            "tp2": ps["tp2"],
+            "be_trigger": ps["be_trigger"],
+            "lot_size": ps["lot_size"],
+            "risk_usd": ps["risk_usd"],
+            "risk_pips": ps["risk_pips"],
+            "ml_decision": ps["ml_decision"],
+            "ml_expected_R": ps["ml_expected_R"],
+            "ml_win_prob": ps["ml_win_prob"],
+            "risk_approved": ps["risk_approved"],
+            "risk_veto": ps["risk_veto"],
+            "k_vol": ps["k_vol"],
+            "effective_risk_pct": ps["effective_risk_pct"],
+            "confidence": round(ps["ml_win_prob"] * 100, 1),
+            "why": f"• 1. Strategy Engine: `{ps['strategy']}` ({ps['action']})\n• 2. Rationale: {ps['rationale']}\n• 3. Execution Mode: `SHADOW_SIGNAL (Real-Time Spot Feed — MT5 Disconnected)`",
+        }
+        if "FORECAST" in title_prefix or "INSTANT" in title_prefix:
+            title_prefix = "⚡ PREDICTIVE AI SIGNAL (SHADOW DEMO)"
+
     wl = setup.get("watchlist", {})
     sched = wl.get("timing_schedule", {})
     nearest_bsl = wl.get("nearest_bsl")
@@ -1204,35 +1297,46 @@ def run_24_7_service():
                                 bar_timestamp=candle_bar_time,
                             )
 
-                            # 2. Gating: Actionable execution if approved, otherwise forward-looking predictive forecast
-                            is_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE" and setup["action"] != "HOLD"
+                            # 2. Gating: Actionable execution if approved (Live MT5 OR Shadow Predictive Signal), otherwise forecast
+                            ps = setup.get("predictive_signal")
+                            is_live_actionable = setup.get("risk_approved") and setup.get("ml_decision") == "TAKE" and setup["action"] != "HOLD"
+                            is_shadow_actionable = bool(
+                                not is_live_actionable
+                                and ps
+                                and ps.get("action") in ("BUY", "SELL")
+                                and ps.get("risk_approved")
+                                and ps.get("ml_decision") == "TAKE"
+                            )
+                            is_actionable = is_live_actionable or is_shadow_actionable
                             if is_actionable:
-                                card = format_card(setup, "⚡ 24/7 MASTER AI SIGNAL")
+                                exec_src = setup if is_live_actionable else ps
+                                card_title = "⚡ 24/7 MASTER AI SIGNAL" if is_live_actionable else "⚡ PREDICTIVE AI SIGNAL (SHADOW DEMO)"
+                                card = format_card(setup, card_title)
                                 for cid in list(subscribers):
                                     robust_send_telegram(token, cid, card, reply_markup=get_institutional_keyboard())
                                 mgr.record_prediction(
-                                    action=setup["action"],
-                                    entry=setup["entry"],
-                                    sl=setup["sl"],
-                                    tp1=setup["tp1"],
-                                    tp2=setup["tp2"],
+                                    action=exec_src["action"],
+                                    entry=exec_src["entry"],
+                                    sl=exec_src["sl"],
+                                    tp1=exec_src["tp1"],
+                                    tp2=exec_src["tp2"],
                                     bar_time=candle_bar_time,
-                                    confidence=setup["confidence"],
+                                    confidence=round(exec_src.get("ml_win_prob", 0.65) * 100, 1) if not is_live_actionable else setup["confidence"],
                                     rsi=setup["rsi"],
-                                    be_trigger=setup.get("be_trigger"),
+                                    be_trigger=exec_src.get("be_trigger"),
                                 )
                                 if len(broker.open_positions) == 0:
                                     executed_pos = broker.execute_order(
-                                        side=setup["action"],
-                                        lots=setup.get("lot_size", 0.01),
-                                        current_price=setup["entry"],
-                                        sl=setup["sl"],
-                                        tp1=setup["tp1"],
-                                        tp2=setup["tp2"],
+                                        side=exec_src["action"],
+                                        lots=exec_src.get("lot_size", 0.01),
+                                        current_price=exec_src["entry"],
+                                        sl=exec_src["sl"],
+                                        tp1=exec_src["tp1"],
+                                        tp2=exec_src["tp2"],
                                     )
                                     if executed_pos:
-                                        logger.info("Octa Shadow Demo executed order %s (%s %.2f lots @ %.2f)", executed_pos.ticket, setup["action"], executed_pos.lots, executed_pos.open_price)
-                                logger.info("Dispatched 24/7 Master AI Signal (%s) [ID: %s] at %.2f (Confidence: %.1f%%, E[R]: +%.2fR)", setup["action"], sig_id, setup["price"], setup["confidence"], setup.get("ml_expected_R", 0.0))
+                                        logger.info("Octa Shadow Demo executed order %s (%s %.2f lots @ %.2f)", executed_pos.ticket, exec_src["action"], executed_pos.lots, executed_pos.open_price)
+                                logger.info("Dispatched %s (%s) [ID: %s] at %.2f (E[R]: +%.2fR)", card_title, exec_src["action"], sig_id, setup["price"], exec_src.get("ml_expected_R", 0.0))
                             else:
                                 # Continuous Institutional Predictive Setup Forecast (Upcoming Liquidity Sweep Target)
                                 card = format_card(setup, "🔮 INSTITUTIONAL PREDICTIVE FORECAST")
